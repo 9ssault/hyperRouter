@@ -84,6 +84,21 @@ hyperrouter doctor
 
 Keys are read from the environment only. The router never stores provider secrets.
 
+Onboard a provider with a live check instead of hand-editing config:
+
+```bash
+export GROQ_API_KEY=...                 # or: ... | hyperrouter connect groq --key-stdin
+hyperrouter connect groq                # verifies /models, then a tiny completion
+hyperrouter connect pollinations --keyless
+hyperrouter accounts test               # re-verify every registered account
+hyperrouter providers --search mistral  # filter the provider list
+```
+
+`connect` validates before writing anything: a 401/403 fails without registering, and
+`--force` is required to keep a provider that did not answer. It stores only the env
+variable name, never the key. Quota weights, monthly and daily limits can be set at
+the same time (`--weight`, `--monthly-limit`, `--daily-limit`).
+
 ## Agent
 
 The TUI is an agent, not a chatbot. The model gets ten built-in tools, every enabled
@@ -298,10 +313,29 @@ claude -p "explain this repo"      # runs on the free pool, no Anthropic key
 
 Streaming is translated from a completed free-model response, so tokens arrive in
 one batch rather than incrementally. Tool calls stream as a single `input_json_delta`.
-This compatibility layer follows the approach of
-[free-claude-code](https://github.com/alishahryar1/free-claude-code) (AGPL-3.0); no
-code from that project is copied here — the translation, routing and harness code is
-original and MIT.
+
+### Feature parity, reworked
+
+The capabilities associated with [free-claude-code](https://github.com/alishahryar1/free-claude-code)
+(AGPL-3.0) exist here as original MIT code with different mechanics — no source is
+copied, and the architecture is deliberately different:
+
+| Outcome | free-claude-code shape | hyperRouter shape |
+| --- | --- | --- |
+| Many free providers | 61 curated integrations | 150 providers discovered from live catalogues, plus a registry for tiers they miss |
+| Claude Code on free models | Anthropic server + per-agent integrations | `/v1/messages` shim + `setup claude` writing `~/.claude/settings.json` |
+| Twelve coding agents | dedicated harness modules | one registry (`AGENT_BACKENDS`) with env kind + generic launcher |
+| Provider onboarding | desktop UI with searchable cards | `connect <provider>` with live validation, `--search`, `--key-stdin` |
+| Credential safety | account store + validation | env-reference accounts only, `accounts test`, never writes keys |
+| Web browsing | browser server + artifacts | built-in `web_search`/`web_fetch` + Playwright MCP, 15-minute cache |
+| Sessions | code-session event store | JSON session files + JSONL transcripts + `sessions list/show/export/resume/prune` |
+| Updates | installer + updater scripts | `hyperrouter update --check/--apply`, `install.sh`, tag-based releases |
+| Uninstall | platform scripts | `hyperrouter uninstall --dry-run/--yes/--purge` |
+| Diagnostics | doctor + admin dashboard | `doctor`, `/ready`, authenticated `/admin/stats` |
+
+Not ported because they belong to a desktop product rather than a CLI: the tray app,
+packaged macOS/Windows installers, JetBrains/VS Code plugins, and chat-platform bots.
+Provider OAuth sign-in flows (beyond env keys) are also not implemented.
 
 Inside `chat`, `/agent opencode` or `/agent dsh` sends each message to that agent's
 headless mode (`opencode run`, `dsh headless`) and prints the result in this CLI —
@@ -440,6 +474,21 @@ hyperrouter settings edit
 Config lives in `~/.config/hyperrouter/config.json`; data in
 `~/.local/share/hyperrouter/`. `hyperrouter config` is an alias.
 
+## Sessions and history
+
+Every TUI conversation is a session file; every run also appends a JSONL transcript.
+
+```bash
+hyperrouter sessions list               # name, kind, messages, model, updated
+hyperrouter sessions show release-fix --limit 10
+hyperrouter sessions export release-fix --output release-fix.md
+hyperrouter sessions resume release-fix # prints the chat command
+hyperrouter sessions prune --days 30 --dry-run
+hyperrouter sessions delete old-session --yes
+```
+
+Pruning and deletion refuse to run without `--yes`; `--dry-run` is always safe.
+
 ## Usage
 
 ```bash
@@ -452,6 +501,23 @@ Every request is recorded in SQLite with provider, model, account, status, token
 counts and latency. `hyperrouter quota` shows per-account limits; `doctor` checks the
 catalogue, database, service, auth, client wiring, catalogue age, active web
 backends, sandbox availability, Python version and whether curses is importable.
+
+## Operations
+
+```bash
+hyperrouter uninstall --dry-run         # what would be removed
+hyperrouter uninstall --yes             # stop service, remove script + symlinks
+hyperrouter uninstall --yes --purge     # also delete config and data
+```
+
+Provider keys live in your shell profile and are never touched by uninstall. The
+service also exposes readiness and an authenticated stats endpoint:
+
+```bash
+get() { curl -s -H "Authorization: Bearer $(hyperrouter keys show)" "$@"; }
+get http://127.0.0.1:8787/ready          # ready, model count, active cooldowns
+get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, cooldowns
+```
 
 ## Development
 

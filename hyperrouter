@@ -57,7 +57,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2556,6 +2556,47 @@ class RouterHandler:
                 "accounts": {"total": len(accounts), "providers": providers},
             })
             return
+        if path == "/ready":
+            candidates = pick_models("chat", limit=1)
+            self.send_json(200 if candidates else 503, {
+                "ready": bool(candidates), "version": VERSION,
+                "catalog": len(load_catalog().get("models") or []),
+                "cooldowns": {name: round(provider_cooling(name), 1)
+                              for name in list(PROVIDER_COOLDOWN) if provider_cooling(name) > 0},
+            })
+            return
+        if path == "/admin/stats":
+            if not self.require_auth():
+                return
+            conn = connect()
+            try:
+                totals = conn.execute(
+                    "SELECT COUNT(*) AS n, SUM(status = 'ok') AS ok,"
+                    " COALESCE(SUM(tokens_in), 0) AS tin, COALESCE(SUM(tokens_out), 0) AS tout,"
+                    " COALESCE(AVG(latency_ms), 0) AS lat FROM requests"
+                ).fetchone()
+                by_provider = [dict(row) for row in conn.execute(
+                    "SELECT provider, COUNT(*) AS n, COALESCE(SUM(tokens_out), 0) AS tout"
+                    " FROM requests GROUP BY provider ORDER BY n DESC LIMIT 12")]
+            finally:
+                conn.close()
+            accounts = discover_accounts()
+            self.send_json(200, {
+                "version": VERSION,
+                "requests": {"total": int(totals["n"] or 0), "ok": int(totals["ok"] or 0),
+                             "tokens_in": int(totals["tin"] or 0),
+                             "tokens_out": int(totals["tout"] or 0),
+                             "avg_latency_ms": round(float(totals["lat"] or 0), 1)},
+                "providers": by_provider,
+                "accounts": {"total": len(accounts),
+                             "by_provider": sorted({a["provider"] for a in accounts})},
+                "cooldowns": {name: round(provider_cooling(name), 1)
+                              for name in list(PROVIDER_COOLDOWN) if provider_cooling(name) > 0},
+                "catalog": {"models": len(load_catalog().get("models") or []),
+                             "generated_at": load_catalog().get("generated_at")},
+                "mcp_servers": len(mcp_servers()),
+            })
+            return
         if path == "/v1/models":
             if not self.require_auth():
                 return
@@ -4083,6 +4124,10 @@ def cmd_providers(args: argparse.Namespace) -> int:
             "free_models": sum(1 for m in catalog.get("models") or []
                                if m.get("provider") == pid and m.get("free_type") != "discontinued"),
         })
+    needle = str(getattr(args, "search", "") or "").lower()
+    if needle:
+        rows = [row for row in rows if needle in str(row["id"]).lower()
+                or needle in str(row["name"] or "").lower()]
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
@@ -8258,6 +8303,77 @@ def cmd_service(args: argparse.Namespace) -> int:
     return service_status(host, port, as_json=args.json)
 
 
+def validate_provider_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool, str]:
+    """Check a provider key against its models endpoint, then a tiny completion."""
+    if not key:
+        return False, "empty key"
+    url = models_url(provider)
+    if not url:
+        return False, "this provider has no known endpoint"
+    headers = {"Authorization": f"Bearer {key}", "x-api-key": key,
+               "anthropic-version": "2023-06-01"}
+    status, _, data = http_json("GET", url, headers=headers, timeout=timeout)
+    if status == 200:
+        count = len(data.get("data") or []) if isinstance(data, dict) else 0
+        return True, f"models endpoint ok ({count} models)"
+    if status in {401, 403}:
+        return False, f"key rejected (HTTP {status})"
+    chat = chat_url(provider)
+    model = next((m.get("model") for m in load_catalog().get("models") or []
+                  if m.get("provider") == provider and m.get("routable")), None)
+    if not chat or not model:
+        return False, f"models endpoint returned HTTP {status}"
+    payload = json.dumps({"model": model, "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "hi"}]}).encode()
+    status, _, data = http_json("POST", chat, headers={**headers, "Content-Type": "application/json"},
+                                payload=payload, timeout=timeout)
+    if status == 200:
+        return True, "completion ok"
+    error = data.get("error") if isinstance(data, dict) else data
+    return False, f"HTTP {status} {redact(str(error))[:120]}"
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    """Register a provider credential by env reference and verify it works."""
+    provider = (args.provider or "").strip()
+    meta = provider_meta(provider)
+    if not meta:
+        die(f"unknown provider: {provider} (see `hyperrouter providers`)")
+    names = account_env_names(provider)
+    env_name = (args.env or (names[0] if names else "")).strip()
+    key = ""
+    if args.key_stdin:
+        key = sys.stdin.readline().strip()
+    elif env_name:
+        key = env_value(env_name)
+    if args.keyless:
+        env_name, key = "", ""
+    if not args.keyless and not key:
+        die(f"no key found. Export it first (`export {env_name}=...`), pipe it with "
+            "--key-stdin, or pass --keyless for a provider that needs none.")
+    if key:
+        ok, detail = validate_provider_key(provider, key)
+        print(f"{'OK  ' if ok else 'FAIL'} {provider}: {detail}")
+        if not ok and not args.force:
+            return 1
+    config = load_config()
+    item = {"provider": provider, "env": env_name, "label": args.label or env_name or "keyless",
+            "monthly_limit": int(args.monthly_limit or 0),
+            "daily_limit": int(args.daily_limit or 0), "weight": float(args.weight or 1.0)}
+    accounts = config.setdefault("accounts", [])
+    accounts[:] = [a for a in accounts if not (
+        a.get("provider") == item["provider"] and a.get("env") == item["env"]
+        and (a.get("label") or "") == item["label"])]
+    accounts.append(item)
+    save_config(config)
+    print(f"registered {provider} via {env_name or 'keyless'}")
+    if env_name and not env_value(env_name):
+        print(f"set the key in your shell: export {env_name}=... (the router reads it from "
+              "the environment; it is never written to config)")
+    print(f"check: {PROG} accounts test --provider {provider} && {PROG} models --task coding")
+    return 0
+
+
 def cmd_accounts(args: argparse.Namespace) -> int:
     config = load_config()
     if args.action == "list":
@@ -8476,6 +8592,161 @@ def cmd_usage(args: argparse.Namespace) -> int:
             q = item["quota"]
             left = "unlimited" if q["remaining"] < 0 else f"{q['fraction'] * 100:.0f}%"
             print(f"  {item['provider']:<18} {item['label']:<20} {left}")
+    return 0
+
+
+def _session_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(sessions_dir().glob("*.json"), key=lambda p: p.stat().st_mtime,
+                       reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        messages = data.get("messages") if isinstance(data, dict) else data
+        if not isinstance(messages, list):
+            messages = []
+        rows.append({"name": path.stem, "path": str(path), "kind": "session",
+                     "messages": len(messages), "model": (data.get("model")
+                                                          if isinstance(data, dict) else ""),
+                     "updated": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")})
+    for path in sorted(transcript_dir(config).glob("*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True):
+        count = 0
+        try:
+            with path.open(encoding="utf-8") as fh:
+                count = sum(1 for line in fh if line.strip())
+        except OSError:
+            continue
+        rows.append({"name": path.stem, "path": str(path), "kind": "transcript",
+                     "messages": count, "model": "",
+                     "updated": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")})
+    return rows
+
+
+def cmd_sessions(args: argparse.Namespace) -> int:
+    config = load_config()
+    action = args.action or "list"
+    rows = _session_rows(config)
+    target = (args.name or "").strip()
+    if action == "list":
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no saved sessions yet - the TUI writes one per conversation")
+            return 0
+        print(f"{'name':<34} {'kind':<11} {'msgs':>5}  {'updated':<20} model")
+        for row in rows[:60]:
+            print(f"{row['name'][:34]:<34} {row['kind']:<11} {row['messages']:>5}  "
+                  f"{row['updated']:<20} {row['model'] or ''}")
+        print(f"\n{len(rows)} item(s) in {sessions_dir()} and {transcript_dir(config)}")
+        return 0
+    chosen = next((row for row in rows if row["name"] == target), None)
+    if chosen is None:
+        die(f"no session or transcript named {target!r} (see `{PROG} sessions list`)")
+    path = Path(chosen["path"])
+    if action in {"show", "export"}:
+        if chosen["kind"] == "session":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            messages = data.get("messages") if isinstance(data, dict) else data
+            messages = [m for m in (messages or []) if isinstance(m, dict)]
+        else:
+            messages = []
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict):
+                        messages.append({"role": str(entry.get("role") or "info"),
+                                         "content": str(entry.get("content") or "")})
+        if action == "show":
+            limit = max(1, min(int(args.limit or 20), 200))
+            for message in messages[-limit:]:
+                print(f"## {message.get('role')}\n{content_to_text(message.get('content'))[:2000]}\n")
+            return 0
+        target_path = Path(os.path.expanduser(args.output)) if args.output else (
+            Path.cwd() / f"{chosen['name']}.md")
+        lines = [f"# {PRODUCT} session: {chosen['name']}", ""]
+        for message in messages:
+            lines.extend([f"## {message.get('role')}", "",
+                          content_to_text(message.get("content")), ""])
+        target_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"exported {len(messages)} message(s) to {target_path}")
+        return 0
+    if action == "resume":
+        if chosen["kind"] != "session":
+            die("only TUI sessions can be resumed; transcripts are read-only history")
+        print(f"{PROG} chat --session {shlex_join([str(path)])}")
+        return 0
+    if action == "delete":
+        if not args.yes:
+            die("refusing to delete without --yes")
+        path.unlink(missing_ok=True)
+        print(f"deleted {path}")
+        return 0
+    if action == "prune":
+        days = max(1, int(args.days or 30))
+        cutoff = time.time() - days * 86400
+        removed = 0
+        for row in rows:
+            candidate = Path(row["path"])
+            if candidate.stat().st_mtime >= cutoff:
+                continue
+            if args.dry_run:
+                print(f"would delete {candidate}")
+                continue
+            if not args.yes:
+                die("refusing to prune without --yes")
+            candidate.unlink(missing_ok=True)
+            removed += 1
+        print(f"pruned {removed} item(s) older than {days} day(s)" if not args.dry_run
+              else f"{sum(1 for r in rows if Path(r['path']).stat().st_mtime < cutoff)} "
+                   f"item(s) older than {days} day(s)")
+        return 0
+    die(f"unknown sessions action: {action}")
+    return 2
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    script = Path(__file__).resolve()
+    targets = [script]
+    for name in ("hyperRouter", "agent-router"):
+        link = script.with_name(name)
+        if link.is_symlink() or (link.exists() and link.resolve() == script):
+            targets.append(link)
+    config_dir = CONFIG_PATH.parent
+    data_dir = DATA_HOME
+    actions = [f"remove {path}" for path in targets]
+    if args.purge:
+        actions.append(f"remove {config_dir}")
+        actions.append(f"remove {data_dir}")
+    if args.dry_run:
+        for action in actions:
+            print(f"would {action}")
+        return 0
+    if not args.yes:
+        die("refusing to uninstall without --yes (try --dry-run first)")
+    if not args.keep_service:
+        try:
+            service_stop()
+        except Exception:  # noqa: BLE001 - uninstall must not fail on a missing service
+            pass
+    for path in targets:
+        try:
+            path.unlink()
+            print(f"removed {path}")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            eprint(f"{PROG}: could not remove {path}: {exc}")
+    if args.purge:
+        for path in (config_dir, data_dir):
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"removed {path}")
+    print("uninstalled. Provider keys in your shell profile were left alone.")
     return 0
 
 
@@ -9233,6 +9504,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_sources)
 
     p = sub.add_parser("providers", help="list providers and configured account counts")
+    p.add_argument("--search", help="filter by provider id or name")
     p.add_argument("--json", action="store_true")
     p.add_argument("--template", action="store_true",
                    help="print an export template for provider API keys")
@@ -9432,6 +9704,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_service)
+
+    p = sub.add_parser("connect", help="register and verify a provider credential")
+    p.add_argument("provider")
+    p.add_argument("--env", help="environment variable holding the key")
+    p.add_argument("--key-stdin", action="store_true", help="read the key from stdin, never argv")
+    p.add_argument("--keyless", action="store_true", help="the provider needs no key")
+    p.add_argument("--label")
+    p.add_argument("--monthly-limit", type=int, default=0)
+    p.add_argument("--daily-limit", type=int, default=0)
+    p.add_argument("--weight", type=float, default=1.0)
+    p.add_argument("--force", action="store_true", help="register even if validation fails")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("sessions", help="list, inspect, export or prune saved sessions")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "show", "export", "resume", "delete", "prune"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--output")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("uninstall", help="remove the installed script and links")
+    p.add_argument("--purge", action="store_true", help="also delete config and data")
+    p.add_argument("--keep-service", action="store_true", help="leave the proxy running")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("accounts", help="manage provider account references (never raw keys)")
     p.add_argument("action", choices=["list", "add", "remove", "enable", "disable", "test"])
