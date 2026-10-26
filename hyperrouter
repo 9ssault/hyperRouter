@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
+import html as htmllib
 import copy
 import queue
 import threading
@@ -42,6 +44,7 @@ import sys
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zlib
@@ -51,7 +54,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.1.0"
+VERSION = "2.3.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -184,9 +187,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "usage": {"window_days": 7, "rows": 12},
     "ui": {"color": True, "unicode": True, "tui": True},
-    "mcp": {"servers": {}, "timeout_seconds": 30, "max_tool_rounds": 3},
-    "agent": {"enabled": True, "auto_approve": False, "max_rounds": 8,
-              "allow_outside": False, "tool_result_chars": 12000},
+    "mcp": {"servers": {}, "timeout_seconds": 30, "max_tool_rounds": 3,
+            "agent": True},
+    "agent": {"enabled": True, "auto_approve": False, "max_rounds": 10,
+              "allow_outside": False, "tool_result_chars": 12000,
+              "subagents": True, "max_subagents": 4, "subagent_rounds": 4},
     "skills": {"auto_load": [], "catalog_in_prompt": False},
 }
 
@@ -3351,6 +3356,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 actions.append(f"protocol: {'updated' if existing_protocol else 'wrote'} {protocol}")
         else:
             actions.append(f"protocol: {protocol} already current")
+        if not args.no_skills:
+            if args.dry_run:
+                actions.append(f"skills: would install {len(DEFAULT_SKILL_COLLECTIONS)} default collections")
+            else:
+                actions.extend(ensure_default_skills(verbose=False))
+                if not any(line.startswith("skills:") for line in actions):
+                    actions.append(f"skills: {len(DEFAULT_SKILL_COLLECTIONS)} collections already installed")
+        if not args.no_mcp:
+            if args.dry_run:
+                actions.append("mcp: would enable the default web servers")
+            else:
+                actions.extend(ensure_default_mcp())
         if args.start and not args.dry_run:
             actions.append("starting router service")
             service_start("127.0.0.1", 8787)
@@ -3429,6 +3446,10 @@ SETTINGS_DOCS: dict[str, str] = {
     "agent.max_rounds": "Tool rounds before the agent must summarise",
     "agent.allow_outside": "Allow file tools outside the working directory",
     "agent.tool_result_chars": "How much tool output is kept in context",
+    "mcp.agent": "Give the agent the tools of every enabled MCP server",
+    "agent.subagents": "Let the agent fan work out to parallel workers",
+    "agent.max_subagents": "Parallel workers per subagent call",
+    "agent.subagent_rounds": "Tool rounds allowed to each worker",
     "ui.tui": "Use the full-screen TUI for interactive chat",
     "usage.window_days": "Default lookback window for `hyperrouter usage`",
     "usage.rows": "Default number of rows in usage tables",
@@ -3853,6 +3874,26 @@ def cmd_prompt(args: argparse.Namespace) -> int:
 SKILL_ROOT = CONFIG_HOME / "skills"
 ANTHROPIC_SKILLS_REPO = "anthropics/skills"
 
+# Collections installed by `skills install-defaults` and by `setup`.
+# repo -> directory name under SKILL_ROOT
+DEFAULT_SKILL_COLLECTIONS: dict[str, str] = {
+    "anthropics/skills": "skills",
+    "obra/superpowers": "superpowers",
+    "vercel-labs/agent-skills": "vercel-agent-skills",
+    "addyosmani/agent-skills": "agent-skills",
+    "K-Dense-AI/scientific-agent-skills": "scientific-agent-skills",
+    "alirezarezvani/claude-skills": "claude-skills",
+    "coreyhaines31/marketingskills": "marketingskills",
+    "gamedev-skills/awesome-gamedev-agent-skills": "awesome-gamedev-agent-skills",
+    "bergside/awesome-design-skills": "awesome-design-skills",
+    "Leonxlnx/taste-skill": "taste-skill",
+    "blader/humanizer": "humanizer",
+    "cathrynlavery/diagram-design": "diagram-design",
+    "ayghri/i-have-adhd": "i-have-adhd",
+    "SnailSploit/Claude-Red": "Claude-Red",
+    "mukul975/Anthropic-Cybersecurity-Skills": "Anthropic-Cybersecurity-Skills",
+}
+
 
 def skill_search_dirs() -> list[Path]:
     dirs = [SKILL_ROOT, HOME / ".agents" / "skills"]
@@ -3958,22 +3999,22 @@ def skill_catalog_text(limit: int = 60) -> str:
     return "\n".join(lines)
 
 
-def install_skill_repo(target: str) -> tuple[bool, str]:
+def install_skill_repo(target: str, name: str | None = None) -> tuple[bool, str]:
     if not shutil.which("git"):
         return False, "git is not installed"
     value = target.strip()
     if value.startswith("http://") or value.startswith("https://"):
         url = value
-        name = url.rstrip("/").split("/")[-1].removesuffix(".git")
+        name = name or url.rstrip("/").split("/")[-1].removesuffix(".git")
     elif "/" in value and not Path(value).exists():
         url = f"https://github.com/{value}.git"
-        name = value.split("/")[-1]
+        name = name or value.split("/")[-1]
     else:
         path = Path(value).expanduser()
         if not path.is_dir():
             return False, f"not a local directory: {value}"
         url = str(path)
-        name = path.name
+        name = name or path.name
     SKILL_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = SKILL_ROOT / name
     if destination.exists():
@@ -3986,8 +4027,29 @@ def install_skill_repo(target: str) -> tuple[bool, str]:
     return True, f"installed {name} with {found} skill(s) into {destination}"
 
 
+def ensure_default_skills(verbose: bool = True) -> list[str]:
+    """Install every collection in DEFAULT_SKILL_COLLECTIONS that is missing."""
+    actions: list[str] = []
+    for repo, folder in DEFAULT_SKILL_COLLECTIONS.items():
+        destination = SKILL_ROOT / folder
+        if destination.exists():
+            continue
+        ok, message = install_skill_repo(repo, name=folder)
+        if verbose:
+            print(message)
+        actions.append(f"skills: {'installed' if ok else 'failed'} {repo} -> {message}")
+    if verbose and not actions:
+        print(f"skills: all {len(DEFAULT_SKILL_COLLECTIONS)} default collections are installed")
+    return actions
+
+
 def cmd_skills(args: argparse.Namespace) -> int:
     action = args.action or "list"
+    if action in {"install-defaults", "defaults", "sync"}:
+        actions = ensure_default_skills(verbose=True)
+        total = len(discover_skills())
+        print(f"{len(DEFAULT_SKILL_COLLECTIONS)} default collections, {total} skill(s) installed")
+        return 0 if not any("failed" in line for line in actions) else 1
     if action == "path":
         print(SKILL_ROOT)
         for path in skill_search_dirs():
@@ -4046,10 +4108,74 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_PRESETS: dict[str, dict[str, Any]] = {
     "rea": {
         "command": "npx", "args": ["-y", "rea-agents@latest", "mcp"],
-        "env": {}, "enabled": True,
+        "env": {}, "enabled": True, "agent": False,
         "description": "REA — reverse engineer binaries, apps and runtime behavior",
     },
+    "ddg": {
+        "command": "npx", "args": ["-y", "duckduckgo-mcp-server"],
+        "env": {}, "enabled": True,
+        "description": "DuckDuckGo web search — keyless, no account",
+    },
+    "playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest", "--headless", "--browser", "chromium"],
+        "env": {}, "enabled": True,
+        "description": "Headless browser: navigate, snapshot and crawl real pages",
+    },
+    "brave": {
+        "command": "npx", "args": ["-y", "@brave/brave-search-mcp-server"],
+        "env": {"BRAVE_API_KEY": ""}, "enabled": False, "requires": "BRAVE_API_KEY",
+        "description": "Brave Search API — needs a free BRAVE_API_KEY",
+    },
+    "tavily": {
+        "command": "npx", "args": ["-y", "tavily-mcp"],
+        "env": {"TAVILY_API_KEY": ""}, "enabled": False, "requires": "TAVILY_API_KEY",
+        "description": "Tavily search/extract — needs TAVILY_API_KEY",
+    },
+    "exa": {
+        "command": "npx", "args": ["-y", "exa-mcp-server"],
+        "env": {"EXA_API_KEY": ""}, "enabled": False, "requires": "EXA_API_KEY",
+        "description": "Exa neural search — needs EXA_API_KEY",
+    },
+    "firecrawl": {
+        "command": "npx", "args": ["-y", "firecrawl-mcp"],
+        "env": {"FIRECRAWL_API_KEY": ""}, "enabled": False, "requires": "FIRECRAWL_API_KEY",
+        "description": "Firecrawl crawl/scrape — needs FIRECRAWL_API_KEY",
+    },
 }
+
+# Enabled by `setup` and `skills`-style bootstrap. Keyless servers come up working;
+# keyed ones are registered but off until the named variable is exported.
+DEFAULT_MCP_SERVERS = ["ddg", "playwright", "brave", "tavily", "exa", "firecrawl"]
+
+
+def ensure_default_mcp() -> list[str]:
+    config = load_config()
+    block = config.setdefault("mcp", {"servers": {}, "timeout_seconds": 30,
+                                      "max_tool_rounds": 3})
+    servers = block.setdefault("servers", {})
+    actions: list[str] = []
+    for name in DEFAULT_MCP_SERVERS:
+        preset = MCP_PRESETS.get(name) or {}
+        requires = str(preset.get("requires") or "")
+        enabled = not requires
+        entry = {key: copy.deepcopy(value) for key, value in preset.items()
+                 if key not in {"requires", "description"}}
+        entry["enabled"] = enabled
+        if name not in servers:
+            servers[name] = entry
+            actions.append(f"mcp: registered {name} ({'enabled' if enabled else 'off, needs ' + requires})")
+        else:
+            if "agent" in preset and servers[name].get("agent") != preset["agent"]:
+                servers[name]["agent"] = preset["agent"]
+                actions.append(f"mcp: {name} tools {'in' if preset['agent'] else 'out of'} the agent loop")
+            if requires and not servers[name].get("enabled") and os.environ.get(requires):
+                servers[name]["enabled"] = True
+                actions.append(f"mcp: enabled {name} ({requires} is set)")
+    save_config(config)
+    if not actions:
+        actions.append(f"mcp: {len(DEFAULT_MCP_SERVERS)} default servers already registered")
+    return actions
 
 
 class McpError(RuntimeError):
@@ -4153,14 +4279,107 @@ def mcp_servers(config: dict[str, Any] | None = None) -> dict[str, dict[str, Any
     return {str(k): dict(v) for k, v in servers.items() if isinstance(v, dict)}
 
 
+MCP_SESSIONS: dict[str, McpClient] = {}
+MCP_SESSION_LOCK = threading.RLock()
+
+
 def mcp_call(server_name: str, tool: str, arguments: dict[str, Any],
-             timeout: float = 60.0) -> Any:
+             timeout: float = 60.0, persistent: bool = False) -> Any:
     servers = mcp_servers()
     server = servers.get(server_name)
     if not server:
         raise McpError(f"unknown MCP server: {server_name}")
-    with McpClient(server, timeout=timeout) as client:
+    if not persistent:
+        with McpClient(server, timeout=timeout) as client:
+            return client.call_tool(tool, arguments)
+    # A browser server keeps its page between calls, so reuse one process per turn.
+    with MCP_SESSION_LOCK:
+        client = MCP_SESSIONS.get(server_name)
+        if client is not None and client.proc.poll() is not None:
+            client.close()
+            client = None
+        if client is None:
+            client = McpClient(server, timeout=timeout)
+            MCP_SESSIONS[server_name] = client
         return client.call_tool(tool, arguments)
+
+
+def close_mcp_sessions() -> None:
+    with MCP_SESSION_LOCK:
+        for client in MCP_SESSIONS.values():
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+        MCP_SESSIONS.clear()
+
+
+MCP_AGENT_CACHE: dict[str, Any] = {"key": None, "ts": 0.0, "specs": [], "map": {}}
+MCP_CACHE_TTL = 300.0
+
+
+def _mcp_tool_name(server: str, tool: str) -> str:
+    raw = f"mcp__{server}__{tool}"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", raw)
+    return cleaned[:64]
+
+
+def mcp_agent_specs(config: dict[str, Any] | None = None,
+                    force: bool = False) -> list[dict[str, Any]]:
+    """Function specs for the tools of every enabled MCP server."""
+    if os.environ.get("HYPERROUTER_NO_MCP"):
+        return []
+    config = config or load_config()
+    mcp_cfg = config.get("mcp") or {}
+    if not bool(mcp_cfg.get("agent", True)):
+        return []
+    servers = {name: server for name, server in mcp_servers(config).items()
+               if server.get("enabled", True)
+               and server.get("agent", (MCP_PRESETS.get(name) or {}).get("agent", True))}
+    key = tuple(sorted(servers))
+    now = time.time()
+    if (not force and MCP_AGENT_CACHE.get("key") == key
+            and now - float(MCP_AGENT_CACHE.get("ts") or 0) < MCP_CACHE_TTL):
+        return list(MCP_AGENT_CACHE.get("specs") or [])
+
+    def discover(name: str, server: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
+        try:
+            with McpClient(server, timeout=25.0) as client:
+                listed = client.request("tools/list").get("tools") or []
+            return name, [tool for tool in listed if isinstance(tool, dict)], ""
+        except Exception as exc:  # noqa: BLE001 - a broken server must not block the loop
+            return name, [], str(exc)
+
+    specs: list[dict[str, Any]] = []
+    mapping: dict[str, tuple[str, str]] = {}
+    if servers:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(servers))) as pool:
+            futures = [pool.submit(discover, name, server)
+                       for name, server in servers.items()]
+            for future in concurrent.futures.as_completed(futures, timeout=180):
+                try:
+                    name, tools, error = future.result()
+                except Exception:  # noqa: BLE001
+                    continue
+                if error:
+                    continue
+                for tool in tools:
+                    tool_name = str(tool.get("name") or "").strip()
+                    if not tool_name:
+                        continue
+                    exposed = _mcp_tool_name(name, tool_name)
+                    mapping[exposed] = (name, tool_name)
+                    schema = tool.get("inputSchema")
+                    if not isinstance(schema, dict):
+                        schema = {"type": "object", "properties": {}}
+                    description = str(tool.get("description") or "").strip()
+                    specs.append({"type": "function", "function": {
+                        "name": exposed,
+                        "description": f"[{name}] {description[:700]}".strip(),
+                        "parameters": schema,
+                    }})
+    MCP_AGENT_CACHE.update({"key": key, "ts": now, "specs": specs, "map": mapping})
+    return specs
 
 
 def _mcp_text(result: Any) -> str:
@@ -4188,18 +4407,29 @@ def cmd_mcp(args: argparse.Namespace) -> int:
         print(f"registered MCP server 'rea' -> {' '.join(MCP_PRESETS['rea']['args'])}")
         print(f"check it: {PROG} mcp tools rea")
         return 0
+    if action == "defaults":
+        for line in ensure_default_mcp():
+            print(line)
+        print(f"check them: {PROG} mcp list && {PROG} mcp tools ddg")
+        return 0
     if action == "add":
         if not args.name:
-            die("usage: hyperrouter mcp add <name> --command <cmd> [--args \"-y pkg mcp\"]")
-        command = args.command or (MCP_PRESETS.get(args.name, {}) or {}).get("command")
+            die("usage: hyperrouter mcp add <name|preset> [--command <cmd>] [--args \"...\"]")
+        preset = {key: copy.deepcopy(value) for key, value in
+                  (MCP_PRESETS.get(args.name, {}) or {}).items()
+                  if key not in {"requires", "description"}}
+        command = args.command or preset.get("command")
         if not command:
-            die("--command is required (or use a preset name like 'rea')")
-        argv = args.args.split() if getattr(args, "args", None) else list(
-            (MCP_PRESETS.get(args.name, {}) or {}).get("args") or [])
-        servers[args.name] = {"command": command, "args": argv, "env": {},
+            die("--command is required (or use a preset name like 'ddg', 'playwright')")
+        argv = args.args.split() if getattr(args, "args", None) else list(preset.get("args") or [])
+        servers[args.name] = {"command": command, "args": argv,
+                              "env": preset.get("env") or {},
                               "enabled": True}
         save_config(config)
         print(f"registered MCP server '{args.name}' -> {command} {' '.join(argv)}")
+        requires = str((MCP_PRESETS.get(args.name) or {}).get("requires") or "")
+        if requires:
+            print(f"needs {requires} in the environment for its tools to work")
         return 0
     if action in {"remove", "enable", "disable"}:
         if not args.name:
@@ -4306,6 +4536,8 @@ CHAT_COMMANDS = {
     "/skills": "list installed skills",
     "/skill <name>": "toggle a skill for this session",
     "/mcp [server]": "list MCP servers or their tools",
+    "/tools [on|off]": "turn the coding tools and MCP tools on or off",
+    "/workers": "parallel workers: state and changed files",
     "/init": "write an AGENTS.md for this directory",
     "/exit": "leave chat",
 }
@@ -4888,11 +5120,25 @@ def agent_tool_specs() -> list[dict[str, Any]]:
         spec("run_command", "Run a shell command in the working directory and return its output.",
              {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}},
              ["command"]),
+        spec("web_search", "Search the web (keyless) and return titles, links and snippets.",
+             {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+             ["query"]),
+        spec("web_fetch", "Fetch a URL and return its readable text, for docs, issues, pages.",
+             {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"]),
         spec("todo", "Replace the task list shown to the user (one entry per step).",
              {"items": {"type": "array", "items": {"type": "object", "properties": {
                  "task": {"type": "string"},
                  "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
                  "required": ["task", "status"]}}}, ["items"]),
+        spec("subagent", "Fan work out to parallel workers. Give each worker its own files and "
+             "a self-contained task; independent files only. Returns each worker's report.",
+             {"tasks": {"type": "array", "items": {"type": "object", "properties": {
+                 "files": {"type": "array", "items": {"type": "string"},
+                           "description": "Files this worker owns"},
+                 "task": {"type": "string", "description": "What this worker must do"}},
+                 "required": ["task"]}},
+              "max_workers": {"type": "integer"}},
+             ["tasks"]),
     ]
 
 
@@ -4904,6 +5150,10 @@ def agent_system_prompt(cwd: Path, skills: Sequence[str] = ()) -> str:
         "Never claim a check passed unless you ran it. When the task is done, summarize what "
         "changed and what you verified.",
         "Track multi-step work with the todo tool.",
+        "Use web_search and web_fetch for documentation, errors and current facts; cite the URL "
+        "you relied on.",
+        "For work that splits across independent files, call the subagent tool with one task "
+        "per file group; workers run in parallel and you merge their reports.",
     ]
     agents_md = cwd / "AGENTS.md"
     if agents_md.is_file():
@@ -4929,6 +5179,29 @@ def _cap(text: str, limit: int = 12000) -> str:
     return text[:limit] + f"\n... ({len(text) - limit} more characters)"
 
 
+def diff_preview(path: Path, before: str, after: str, context: int = 3) -> str:
+    """Unified diff between what is on disk and what the tool would write."""
+    if before == after:
+        return f"(no change to {path})"
+    diff = list(difflib.unified_diff(
+        before.splitlines(keepends=True), after.splitlines(keepends=True),
+        fromfile=f"a/{path.name}", tofile=f"b/{path.name}", n=context))
+    if not diff:
+        return f"(no textual change to {path})"
+    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    body = "".join(diff)
+    header = f"{path}  (+{added} -{removed})"
+    if len(diff) > 400:
+        body = "".join(diff[:400]) + f"... ({len(diff) - 400} more diff lines)\n"
+    return header + "\n" + body.rstrip("\n")
+
+
+def preview_footer(preview: str) -> str:
+    first = (preview or "").splitlines()[0] if preview else ""
+    return first
+
+
 def tool_read_file(args: dict[str, Any]) -> str:
     path = _tool_path(args.get("path"))
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -4940,9 +5213,15 @@ def tool_read_file(args: dict[str, Any]) -> str:
     return f"{path} ({len(lines)} lines)\n{body}"
 
 
-def tool_write_file(args: dict[str, Any], allow_outside: bool = False) -> str:
+def tool_write_file(args: dict[str, Any], allow_outside: bool = False,
+                    approve: Any = None) -> str:
     path = _tool_path(args.get("path"), allow_outside)
     content = str(args.get("content") or "")
+    before = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    if path.is_dir():
+        raise ValueError(f"not a file: {path}")
+    if approve and not approve("write", str(path), diff_preview(path, before, content)):
+        return "error: the user denied this write"
     if path.exists():
         backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4950,20 +5229,25 @@ def tool_write_file(args: dict[str, Any], allow_outside: bool = False) -> str:
     return f"wrote {len(content)} chars to {path}"
 
 
-def tool_edit_file(args: dict[str, Any], allow_outside: bool = False) -> str:
+def tool_edit_file(args: dict[str, Any], allow_outside: bool = False,
+                   approve: Any = None) -> str:
     path = _tool_path(args.get("path"), allow_outside)
     old = str(args.get("old_string") or "")
     new = str(args.get("new_string") or "")
     if not old:
         raise ValueError("old_string must not be empty")
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
     text = path.read_text(encoding="utf-8", errors="replace")
     count = text.count(old)
     if count == 0:
         raise ValueError("old_string was not found in the file")
     if count > 1 and not args.get("replace_all"):
         raise ValueError(f"old_string matches {count} times; add more context or set replace_all")
-    backup(path)
     updated = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
+    if approve and not approve("edit", str(path), diff_preview(path, text, updated)):
+        return "error: the user denied this edit"
+    backup(path)
     path.write_text(updated, encoding="utf-8")
     return f"edited {path} ({count} replacement{'s' if count != 1 else ''}, {len(updated)} chars)"
 
@@ -5011,6 +5295,102 @@ def tool_search(args: dict[str, Any]) -> str:
     return _cap("\n".join(hits) or "no matches", 16000)
 
 
+WEB_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def _web_get(url: str, timeout: float = 25.0, max_bytes: int = 3_000_000) -> tuple[str, str]:
+    """Fetch a URL with a browser user agent; return (final_url, body)."""
+    request = urllib.request.Request(url, headers={
+        "User-Agent": WEB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+    })
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        body = response.read(max_bytes).decode(charset, errors="replace")
+        return str(response.geturl() or url), body
+
+
+def _decode_bing_url(href: str) -> str:
+    href = htmllib.unescape(href)
+    if "bing.com/ck/a" not in href:
+        return href
+    match = re.search(r"[?&]u=a1([A-Za-z0-9_\-=]+)", href)
+    if not match:
+        return href
+    raw = match.group(1).replace("-", "+").replace("_", "/")
+    raw += "=" * (-len(raw) % 4)
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return href
+    return decoded if decoded.startswith("http") else href
+
+
+def _strip_html(fragment: str) -> str:
+    text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", fragment,
+                  flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = htmllib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def tool_web_search(args: dict[str, Any]) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = max(1, min(int(args.get("max_results") or 8), 20))
+    url = ("https://www.bing.com/search?q=" + urllib.parse.quote_plus(query)
+           + f"&count={limit}&setlang=en")
+    _, body = _web_get(url, timeout=25.0)
+    blocks = re.split(r'<li class="b_algo"', body)[1:]
+    rows: list[str] = []
+    for block in blocks:
+        match = re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not match:
+            continue
+        link = _decode_bing_url(match.group(1))
+        title = _strip_html(match.group(2))
+        snippet = ""
+        for pattern in (r'<p[^>]*>(.*?)</p>', r'class="b_caption"[^>]*>(.*?)</div>'):
+            found = re.search(pattern, block, re.S)
+            if found:
+                snippet = _strip_html(found.group(1))
+                break
+        rows.append(f"{len(rows) + 1}. {title}\n   {link}\n   {snippet[:400]}")
+        if len(rows) >= limit:
+            break
+    if not rows:
+        return (f"no results parsed for {query!r} (the search page may have been a "
+                "challenge page - try web_fetch on a known URL)")
+    return _cap("\n\n".join(rows), 12000)
+
+
+def tool_web_fetch(args: dict[str, Any]) -> str:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        raise ValueError("url is required")
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("url has no host")
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".local"):
+        raise ValueError("refusing to fetch a local address")
+    limit = max(500, min(int(args.get("max_chars") or 8000), 40000))
+    final_url, body = _web_get(url)
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
+    title = _strip_html(title_match.group(1)) if title_match else ""
+    if "<html" in body.lower() or "<body" in body.lower():
+        content = _strip_html(body)
+    else:
+        content = body.strip()
+    header = f"{title}\n{final_url}\n" if title else f"{final_url}\n"
+    return _cap(header + "\n" + content, limit)
+
+
 def tool_run_command(args: dict[str, Any]) -> str:
     command = str(args.get("command") or "").strip()
     if not command:
@@ -5029,9 +5409,217 @@ def tool_run_command(args: dict[str, Any]) -> str:
     return _cap("\n".join(parts))
 
 
-def execute_tool(name: str, args: dict[str, Any], approve: Any = None,
-                 on_event: Any = None, allow_outside: bool = False) -> str:
+SUBAGENT_MAX_WORKERS = 4
+
+
+def subagent_system_prompt(files: Sequence[str]) -> str:
+    scope = ("\n".join(f"- {name}" for name in files)
+             or "(no explicit files - stay read-only and report what you would change)")
+    return "\n".join([
+        f"You are a worker subagent for {PRODUCT} running in {Path.cwd()}.",
+        "You own only these files:",
+        scope,
+        "Another agent owns everything else, so do not edit files outside your list; read them if "
+        "you need context. Make the change, run a quick check if one is cheap, then answer with a "
+        "short report: what you changed, and what you verified. Do not restate the task.",
+    ])
+
+
+def run_subagent(assignment: dict[str, Any], *, model: str = "auto",
+                 task_hint: str = "coding", max_rounds: int = 4,
+                 approve: Any = None, on_event: Any = None,
+                 allow_outside: bool = False, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one worker to completion and return its report."""
+    ctx = dict(ctx or {})
+    files = [str(name) for name in (assignment.get("files") or [])]
+    siblings = [str(name) for name in (assignment.get("siblings") or [])]
+    task = str(assignment.get("task") or "").strip()
+    if not task:
+        return {"ok": False, "error": "task is required", "files": files}
+    sub_ctx = dict(ctx)
+    sub_ctx["depth"] = int(ctx.get("depth") or 0) + 1
+    sub_ctx["files"] = set(files)
+    sub_ctx.setdefault("changed", set())
+    system = subagent_system_prompt(files)
+    if siblings:
+        system += ("\nOther workers own these files at the same time; do not edit them:\n"
+                   + "\n".join(f"- {name}" for name in siblings))
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
     try:
+        result = agent_turn(messages, model=model, task_hint=task_hint,
+                            max_rounds=max(1, max_rounds), approve=approve,
+                            on_event=on_event, allow_outside=allow_outside,
+                            ctx=sub_ctx, allow_subagents=False)
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc), "files": files}
+    except Exception as exc:  # noqa: BLE001 - reported to the parent
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "files": files}
+    return {"ok": True, "response": result.get("text") or "",
+            "rounds": result.get("rounds"), "interrupted": bool(result.get("interrupted")),
+            "files": files, "changed": sorted(sub_ctx.get("changed") or [])}
+
+
+def tool_subagent(args: dict[str, Any], approve: Any = None, on_event: Any = None,
+                  allow_outside: bool = False, ctx: dict[str, Any] | None = None) -> str:
+    ctx = ctx or {}
+    if int(ctx.get("depth") or 0) > 0:
+        return "error: workers cannot spawn their own workers; do the work directly"
+    tasks = [item for item in (args.get("tasks") or []) if isinstance(item, dict)]
+    tasks = [item for item in tasks if str(item.get("task") or "").strip()]
+    if not tasks:
+        return "error: give at least one task with a \"task\" field"
+    # Two workers on the same file would race and lose an edit, so refuse that.
+    owners: dict[str, int] = {}
+    overlaps: list[str] = []
+    for index, item in enumerate(tasks, 1):
+        for name in item.get("files") or []:
+            key = str(name).strip()
+            if not key:
+                continue
+            if key in owners:
+                overlaps.append(f"{key} (workers {owners[key]} and {index})")
+            owners.setdefault(key, index)
+    if overlaps:
+        return ("error: these files are assigned to more than one worker: "
+                + ", ".join(sorted(set(overlaps)))
+                + ". Split by file, or run the work sequentially.")
+    ceiling = max(1, min(int(ctx.get("max_subagents") or SUBAGENT_MAX_WORKERS),
+                         SUBAGENT_MAX_WORKERS))
+    limit = max(1, min(int(args.get("max_workers") or ceiling), ceiling))
+    workers = tasks[:limit]
+    if len(tasks) > limit:
+        workers = workers[:limit]
+    base_rounds = max(1, int(ctx.get("subagent_rounds") or 4))
+    lock = ctx.get("approval_lock")
+    if approve is not None and lock is not None:
+        raw_approve = approve
+
+        def approve(kind: str, detail: str, preview: str = "") -> bool:  # noqa: F811
+            with lock:
+                return bool(raw_approve(kind, detail, preview))
+    label = {id(item): index + 1 for index, item in enumerate(workers)}
+
+    def emit(kind: str, payload: dict[str, Any]) -> None:
+        if on_event:
+            try:
+                on_event(kind, payload)
+            except Exception:  # noqa: BLE001 - events must never break a worker
+                pass
+
+    def worker_events(worker_id: int) -> Any:
+        def inner(kind: str, payload: dict[str, Any]) -> None:
+            emit(kind, dict(payload or {}, worker=worker_id))
+        return inner
+
+    def retryable(report: dict[str, Any]) -> bool:
+        text = str(report.get("error") or "").lower()
+        return any(bit in text for bit in ("rate limit", "429", "timed out", "timeout",
+                                          "temporarily", "overloaded", "502", "503"))
+
+    def work(item: dict[str, Any], worker_id: int) -> dict[str, Any]:
+        started = time.time()
+        report = run_subagent(item, model=ctx.get("model") or "auto",
+                              task_hint=ctx.get("task_hint") or "coding",
+                              max_rounds=base_rounds, approve=approve,
+                              on_event=worker_events(worker_id),
+                              allow_outside=allow_outside, ctx=ctx)
+        if not report.get("ok") and retryable(report):
+            emit("subagent_start", {"worker": worker_id, "retry": True,
+                                    "files": [str(f) for f in (item.get("files") or [])],
+                                    "task": "retrying after: " + str(report.get("error") or "")[:120]})
+            report = run_subagent(item, model=ctx.get("model") or "auto",
+                                  task_hint=ctx.get("task_hint") or "coding",
+                                  max_rounds=base_rounds, approve=approve,
+                                  on_event=worker_events(worker_id),
+                                  allow_outside=allow_outside, ctx=ctx)
+            report["retried"] = True
+        report["elapsed"] = round(time.time() - started, 1)
+        return report
+
+    reports: dict[int, dict[str, Any]] = {}
+    results: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(limit, len(workers))) as pool:
+        futures = {}
+        for item in workers:
+            worker_id = label[id(item)]
+            siblings = sorted({str(name) for other in workers if other is not item
+                               for name in (other.get("files") or [])})
+            item = dict(item, siblings=siblings)
+            fut = pool.submit(work, item, worker_id)
+            futures[fut] = (worker_id, item)
+            emit("subagent_start", {"worker": worker_id,
+                                    "files": [str(f) for f in (item.get("files") or [])],
+                                    "task": str(item.get("task") or "")[:200]})
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=900):
+                worker_id, item = futures[fut]
+                try:
+                    report = fut.result()
+                except Exception as exc:  # noqa: BLE001 - one worker must not kill the batch
+                    report = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                              "files": [str(f) for f in (item.get("files") or [])]}
+                report["worker"] = worker_id
+                reports[worker_id] = report
+                results.append(report)
+                emit("subagent_done", {"worker": worker_id, "ok": bool(report.get("ok")),
+                                       "changed": report.get("changed") or [],
+                                       "elapsed": report.get("elapsed"),
+                                       "retried": bool(report.get("retried")),
+                                       "error": report.get("error") or ""})
+        except concurrent.futures.TimeoutError:
+            results.append({"ok": False, "error": "worker batch timed out after 900s"})
+    merged = [reports[key] for key in sorted(reports)]
+    if ctx.get("on_change"):
+        for report in merged:
+            for name in report.get("changed") or []:
+                try:
+                    ctx["on_change"](name)
+                except Exception:  # noqa: BLE001
+                    pass
+    changed = sorted({name for report in merged for name in (report.get("changed") or [])})
+    failures = [report.get("worker") for report in merged if not report.get("ok")]
+    # A worker can write outside its list; flag any file two workers both touched.
+    touched: dict[str, set[int]] = {}
+    for report in merged:
+        for name in report.get("changed") or []:
+            touched.setdefault(name, set()).add(int(report.get("worker") or 0))
+    shared = sorted(name for name, owners_set in touched.items() if len(owners_set) > 1)
+    summary = (f"{len(merged) - len(failures)}/{len(merged)} workers ok"
+               + (f", changed {len(changed)} file(s): " + ", ".join(changed[:8]) if changed else "")
+               + (f", failed: {failures}" if failures else "")
+               + (f", WARNING two workers touched: {shared}" if shared else ""))
+    payload = {"summary": summary,
+               "workers": [{"worker": report.get("worker"), "ok": report.get("ok"),
+                            "files": report.get("files") or [],
+                            "changed": report.get("changed") or [],
+                            "elapsed": report.get("elapsed"),
+                            "retried": bool(report.get("retried")),
+                            "error": report.get("error"),
+                            "report": (report.get("response") or "")[:3000]}
+                           for report in merged],
+               "changed": changed, "shared": shared, "failed": failures}
+    return _cap(json.dumps(payload, ensure_ascii=False, indent=2), 16000)
+
+
+def execute_tool(name: str, args: dict[str, Any], approve: Any = None,
+                 on_event: Any = None, allow_outside: bool = False,
+                 ctx: dict[str, Any] | None = None,
+                 allow_subagents: bool = True) -> str:
+    ctx = ctx if isinstance(ctx, dict) else {}
+    try:
+        if name.startswith("mcp__"):
+            target = (MCP_AGENT_CACHE.get("map") or {}).get(name)
+            if not target:
+                return (f"error: unknown MCP tool {name!r} - call it as exposed by "
+                        "tools/list, or reload the session")
+            server, tool = target
+            timeout = float((load_config().get("mcp") or {}).get("timeout_seconds") or 60)
+            result = mcp_call(server, tool, args, timeout=max(15.0, timeout), persistent=True)
+            return _cap(_mcp_text(result), int((load_config().get("agent") or {})
+                                             .get("tool_result_chars") or 12000))
         if name == "read_file":
             return tool_read_file(args)
         if name == "list_dir":
@@ -5039,26 +5627,36 @@ def execute_tool(name: str, args: dict[str, Any], approve: Any = None,
         if name == "search":
             return tool_search(args)
         if name == "write_file":
-            if approve and not approve("write", str(args.get("path"))):
-                return "error: the user denied this write"
-            return tool_write_file(args, allow_outside)
+            output = tool_write_file(args, allow_outside, approve)
+            if not output.startswith("error:"):
+                ctx.setdefault("changed", set()).add(str(args.get("path")))
+            return output
         if name == "edit_file":
-            if approve and not approve("edit", str(args.get("path"))):
-                return "error: the user denied this edit"
-            return tool_edit_file(args, allow_outside)
+            output = tool_edit_file(args, allow_outside, approve)
+            if not output.startswith("error:"):
+                ctx.setdefault("changed", set()).add(str(args.get("path")))
+            return output
         if name == "run_command":
-            if approve and not approve("run", str(args.get("command"))):
+            if approve and not approve("run", str(args.get("command")), ""):
                 return "error: the user denied this command"
             return tool_run_command(args)
+        if name == "web_search":
+            return tool_web_search(args)
+        if name == "web_fetch":
+            return tool_web_fetch(args)
         if name == "todo":
             items = args.get("items") or []
             if on_event:
                 on_event("todos", items)
             done = sum(1 for item in items if str(item.get("status")) == "completed")
             return f"todo list updated ({done}/{len(items)} done)"
+        if name == "subagent":
+            if not allow_subagents:
+                return "error: subagents are disabled in this run; do the work yourself"
+            return tool_subagent(args, approve, on_event, allow_outside, ctx)
         return (f"error: unknown tool {name!r}. Available: read_file, write_file, edit_file, "
-                "list_dir, search, run_command, todo")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                "list_dir, search, run_command, todo, subagent")
+    except (OSError, ValueError, subprocess.SubprocessError, McpError) as exc:
         return f"error: {exc}"
 
 
@@ -5087,9 +5685,28 @@ def agent_turn(
     allow_outside: bool = False,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    ctx: dict[str, Any] | None = None,
+    allow_subagents: bool = True,
 ) -> dict[str, Any]:
     """Run a tool-calling loop until the model answers or rounds run out."""
+    ctx = dict(ctx or {})
+    ctx.setdefault("changed", set())
+    ctx.setdefault("depth", 0)
+    ctx.setdefault("model", model)
+    ctx.setdefault("task_hint", task_hint)
+    if allow_subagents and ctx.get("approval_lock") is None:
+        # One approval prompt at a time, even when workers run in parallel.
+        ctx["approval_lock"] = threading.Lock()
     tools = agent_tool_specs()
+    if not allow_subagents:
+        tools = [spec for spec in tools
+                 if (spec.get("function") or {}).get("name") != "subagent"]
+    try:
+        mcp_specs = mcp_agent_specs()
+    except Exception:  # noqa: BLE001 - a bad MCP config must not stop the agent
+        mcp_specs = []
+    if mcp_specs:
+        tools = tools + mcp_specs
     emit = on_event or (lambda kind, payload: None)
     meta: dict[str, Any] = {}
     for round_index in range(max(1, max_rounds)):
@@ -5138,7 +5755,11 @@ def agent_turn(
             else:
                 args = {}
             emit("tool", {"name": name, "arguments": args})
-            output = execute_tool(name, args, approve, emit, allow_outside)
+            tool_ctx = dict(ctx or {})
+            tool_ctx.setdefault("changed", set())
+            output = execute_tool(name, args, approve, emit, allow_outside, tool_ctx,
+                                  allow_subagents=allow_subagents)
+            ctx.setdefault("changed", set()).update(tool_ctx.get("changed") or [])
             emit("tool_result", {"name": name, "output": _cap(output, 4000)})
             messages.append({"role": "tool", "tool_call_id": str(call.get("id") or name),
                              "content": _cap(output, 12000)})
@@ -5172,7 +5793,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                                       {"role": "user", "content": task}]
     state = {"auto": bool(args.auto or acfg.get("auto_approve")), "denied": 0}
 
-    def approve(kind: str, detail: str) -> bool:
+    def approve(kind: str, detail: str, preview: str = "") -> bool:
         if state["auto"]:
             return True
         if not sys.stdin.isatty():
@@ -5180,6 +5801,11 @@ def cmd_agent(args: argparse.Namespace) -> int:
             eprint(f"{PROG}: denied {kind} (non-interactive; pass --auto): {detail}")
             return False
         print(f"\n[{kind}] {detail}")
+        if preview:
+            for line in preview.splitlines()[:80]:
+                print(f"  {line[:240]}")
+            if len(preview.splitlines()) > 80:
+                print("  ...")
         try:
             answer = input("allow? [y/N/a=always] ").strip().lower()
         except EOFError:
@@ -5203,18 +5829,34 @@ def cmd_agent(args: argparse.Namespace) -> int:
             for item in payload or []:
                 mark = {"completed": "[x]", "in_progress": "[>]"}.get(str(item.get("status")), "[ ]")
                 print(f"  {mark} {item.get('task')}")
+        elif kind == "subagent_start":
+            files = ", ".join(payload.get("files") or []) or "no files"
+            print(f"  ++ worker {payload.get('worker')} ({files}): "
+                  f"{str(payload.get('task') or '')[:160]}")
+        elif kind == "subagent_done":
+            changed = ", ".join(payload.get("changed") or [])
+            state_bit = "ok" if payload.get("ok") else f"failed: {payload.get('error') or ''}"
+            print(f"  ++ worker {payload.get('worker')} {state_bit}"
+                  + (f" (changed {changed})" if changed else ""))
         elif kind == "notice":
             print(f"  ... {payload.get('message')}")
 
     rounds = int(args.max_rounds or acfg.get("max_rounds") or 8)
+    ctx = {"subagent_rounds": int(acfg.get("subagent_rounds") or 4),
+           "max_subagents": int(acfg.get("max_subagents") or 4)}
     try:
         result = agent_turn(messages, model=args.model or "auto", task_hint=args.task_hint or "coding",
                             max_rounds=rounds, approve=approve, on_event=on_event,
                             allow_outside=bool(args.allow_outside or acfg.get("allow_outside")),
                             temperature=getattr(args, "temperature", None),
-                            max_tokens=args.max_tokens or None)
+                            max_tokens=args.max_tokens or None, ctx=ctx,
+                            allow_subagents=bool(acfg.get("subagents", True))
+                            and not getattr(args, "no_subagents", False))
     except RuntimeError as exc:
+        close_mcp_sessions()
         die(str(exc))
+    finally:
+        close_mcp_sessions()
     if args.json:
         print(json.dumps({"task": task, "result": result}, indent=2, default=str))
         return 0
@@ -5247,6 +5889,7 @@ TUI_HELP = [
     ("PgUp/PgDn", "scroll the transcript"),
     ("Up/Down", "scroll, or browse input history"),
     ("Ctrl+L", "redraw"),
+    ("y / n / a", "answer an approval after reading its diff"),
     ("F1 or ?", "this help"),
     ("", ""),
     ("/model", "switch model or alias"),
@@ -5255,6 +5898,8 @@ TUI_HELP = [
     ("/agent", "opencode / dsh / freebuff / off"),
     ("/tools", "turn the coding tools on or off"),
     ("/todos", "show the agent's task list"),
+    ("/workers", "parallel workers: state and changed files"),
+    ("/workers", "parallel workers: state and changed files"),
     ("/skill", "load a session skill"),
     ("/skills", "list installed skills"),
     ("/mcp", "MCP servers and tools"),
@@ -5316,8 +5961,14 @@ class TuiApp:
         self.auto_approve = bool(acfg.get("auto_approve")) or bool(getattr(args, "auto", False))
         self.allow_outside = bool(acfg.get("allow_outside"))
         self.max_rounds = max(1, int(acfg.get("max_rounds") or 8))
+        self.subagents = bool(acfg.get("subagents", True)) and not getattr(args, "no_subagents", False)
+        self.web_tools = bool((self.config.get("mcp") or {}).get("agent", True))
+        self.max_subagents = int(acfg.get("max_subagents") or 4)
+        self.subagent_rounds = int(acfg.get("subagent_rounds") or 4)
         self.todos: list[dict[str, Any]] = []
+        self.workers: dict[int, dict[str, Any]] = {}
         self.approval: dict[str, Any] | None = None
+        self.approval_lock = threading.Lock()
         self.session = chat_session_path(args, self.config) or sessions_dir() / "default.json"
         self.transcript = None
         if ccfg.get("save_transcript", True) and not getattr(args, "no_save", False):
@@ -5355,11 +6006,16 @@ class TuiApp:
             self.c.use_default_colors()
             for index, color in enumerate((self.c.COLOR_CYAN, self.c.COLOR_GREEN,
                                            self.c.COLOR_YELLOW, self.c.COLOR_RED,
-                                           self.c.COLOR_MAGENTA), 1):
+                                           self.c.COLOR_MAGENTA, self.c.COLOR_BLUE), 1):
                 self.c.init_pair(index, color, -1)
-            self.pairs = {"cyan": 1, "green": 2, "yellow": 3, "red": 4, "magenta": 5}
+            self.pairs = {"cyan": 1, "green": 2, "yellow": 3, "red": 4,
+                          "magenta": 5, "blue": 6}
         except self.c.error:
             self.pairs = {}
+        try:
+            self.c.curs_set(1)
+        except self.c.error:
+            pass
 
     def _attr(self, name: str, extra: int = 0) -> int:
         pair = self.pairs.get(name)
@@ -5419,19 +6075,36 @@ class TuiApp:
             out.extend(textwrap.wrap(raw, width, replace_whitespace=False) or [""])
         return out
 
+    def _banner(self, width: int) -> list[tuple[str, int]]:
+        art = [
+            ("", 0),
+            (f"  {PRODUCT} {VERSION}", self._attr("cyan", self.c.A_BOLD)),
+            ("  free models · local tools · one CLI", self._attr("cyan")),
+            ("", 0),
+            ("  Type a request and press Enter — the agent reads, edits, searches and runs.",
+             self.c.A_DIM),
+            ("  Every write shows its diff first. Try: fix the failing test   ·   /models coding",
+             self.c.A_DIM),
+            ("", 0),
+        ]
+        return [(line[: width - 1], attr) for line, attr in art]
+
     def _render_lines(self, width: int) -> list[tuple[str, int]]:
         lines: list[tuple[str, int]] = []
+        if not self.messages and not self.busy:
+            lines.extend(self._banner(width))
         for msg in self.messages:
             role = str(msg.get("role") or "")
             text = str(msg.get("content") or "")
             if role == "user":
-                wrapped = self._wrap(text, width - 6)
+                wrapped = self._wrap(text, width - 8)
                 for index, line in enumerate(wrapped):
-                    prefix = "you > " if index == 0 else "      "
+                    prefix = "  ◆ you  " if index == 0 else "         "
                     lines.append((prefix + line, self._attr("green", self.c.A_BOLD)))
+                lines.append(("", 0))
             elif role == "info":
-                for line in self._wrap(text, width - 2):
-                    lines.append(("  " + line, self.c.A_DIM))
+                for line in self._wrap(text, width - 4):
+                    lines.append(("   " + line, self.c.A_DIM))
             else:
                 meta = msg.get("meta") or {}
                 tag = ""
@@ -5442,21 +6115,22 @@ class TuiApp:
                     if self.show_tokens and (meta.get("tokens_in") or meta.get("tokens_out")):
                         bits.append(f"{human_count(meta.get('tokens_in', 0))} in / "
                                     f"{human_count(meta.get('tokens_out', 0))} out")
-                    tag = "[ " + " · ".join(bits) + " ]"
+                    tag = "  ◆ " + " · ".join(bits)
                 if tag:
-                    lines.append((tag, self._attr("magenta")))
-                for line in self._wrap(text, width - 2):
-                    lines.append((line, 0))
-            lines.append(("", 0))
+                    lines.append((tag, self._attr("magenta", self.c.A_DIM)))
+                for line in self._wrap(text, width - 4):
+                    lines.append(("   " + line, 0))
+                lines.append(("", 0))
         if self.busy:
             if self.stream_buf:
-                body = self._wrap(self.stream_buf, width - 2)
+                body = self._wrap(self.stream_buf, width - 4)
                 for line in body:
-                    lines.append((line, 0))
-                lines.append(("▌", self._attr("cyan")))
+                    lines.append(("   " + line, 0))
+                lines.append(("   ▌", self._attr("cyan")))
             else:
-                spin = "|/-\\"[self.spinner % 4]
-                lines.append((f"{spin} waiting for a free model...", self.c.A_DIM))
+                spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self.spinner % 10]
+                label = "waiting for a free model" if self.spinner else "thinking"
+                lines.append((f"   {spin} {label}...", self._attr("cyan", self.c.A_DIM)))
         return lines
 
     def _draw(self) -> None:
@@ -5467,15 +6141,19 @@ class TuiApp:
                             f"{TUI_MIN_WIDTH}x{TUI_MIN_HEIGHT}", self.c.A_BOLD)
             self.s.refresh()
             return
-        again = " · repeated" if self.busy else ""
-        left = f" {PRODUCT} {VERSION} "
-        right = f"{self.model} · {self.task or 'auto'} · {self.agent_backend or 'free pool'}{again} "
-        self._add(0, 0, left, self._attr("cyan", self.c.A_BOLD))
-        if len(left) + len(right) < width:
-            self._add(0, width - len(right) - 1, right, self.c.A_DIM)
-        self._add(1, 0, "-" * width, self.c.A_DIM)
+        # Header: brand on the left, live routing state on the right.
+        brand = f" {PRODUCT} {VERSION} "
+        self._add(0, 0, brand, self._attr("cyan", self.c.A_BOLD))
+        self._add(0, len(brand), "· terminal coding agent", self.c.A_DIM)
+        again = "● " if self.busy else ""
+        right = (f"{again}{self.model} · {self.task or 'auto'} · "
+                 f"{self.agent_backend or 'free pool'} ")
+        if len(brand) + 24 + len(right) < width:
+            self._add(0, width - len(right) - 1, right,
+                      self._attr("cyan" if not self.busy else "yellow"))
+        self._add(1, 0, "─" * width, self.c.A_DIM)
 
-        top, bottom = 2, height - 4
+        top, bottom = 2, height - 5
         pane = max(1, bottom - top)
         lines = self._render_lines(width - 1)
         if self.scroll:
@@ -5487,11 +6165,16 @@ class TuiApp:
         for offset, (text, attr) in enumerate(visible):
             self._add(top + offset, 0, text[: width - 1], attr)
 
-        prompt = "> "
-        available = width - len(prompt) - 1
+        self._add(height - 4, 0, "─" * width, self.c.A_DIM)
+        prompt = " ❯ "
+        available = width - len(prompt) - 2
         shown = self.buffer[-available:] if available > 0 else ""
         self._add(height - 3, 0, prompt, self._attr("green", self.c.A_BOLD))
-        self._add(height - 3, len(prompt), shown)
+        if shown:
+            self._add(height - 3, len(prompt), shown)
+        else:
+            placeholder = "ask for a change, a fix or an explanation — /help for commands"
+            self._add(height - 3, len(prompt), placeholder[: available], self.c.A_DIM)
         try:
             self.s.move(height - 3, min(width - 1, len(prompt) + len(shown)))
         except self.c.error:
@@ -5500,17 +6183,28 @@ class TuiApp:
         tokens = estimate_tokens("\n".join(str(m.get("content") or "") for m in self.messages))
         state = "working" if self.busy else "ready"
         done = sum(1 for item in self.todos if str(item.get("status")) == "completed")
-        task_bit = f" · tasks {done}/{len(self.todos)}" if self.todos else ""
-        status = (f" {state} · tools {'on' if self.tools_enabled else 'off'} · "
-                  f"{len(self.messages)} msgs · ~{human_count(tokens)} ctx{task_bit}")
-        hint = ("Enter send · Ctrl+P model · Ctrl+O usage · ? help · Ctrl+D quit"
-                if width > 78 else "Enter send · ^P model · ^D quit")
+        segments = [state, f"tools {'on' if self.tools_enabled else 'off'}"]
+        if self.subagents and self.tools_enabled:
+            segments.append("workers on")
+        if self.web_tools and self.tools_enabled:
+            segments.append("web")
+        segments.append(f"{len(self.messages)} msgs")
+        segments.append(f"~{human_count(tokens)} ctx")
+        if self.todos:
+            segments.append(f"tasks {done}/{len(self.todos)}")
+        running = sum(1 for entry in self.workers.values() if entry.get("state") == "running")
+        if running:
+            segments.append(f"{running} worker{'s' if running != 1 else ''} running")
+        status = " " + "  │  ".join(segments)
+        hint = ("Enter send · ^P model · ^O usage · ? help · ^D quit"
+                if width > 92 else "^P model · ^D quit")
         self._add(height - 2, 0, status[: width - 1], self.c.A_DIM)
-        self._add(height - 2, max(0, width - len(hint) - 1), hint[: width - 1], self.c.A_DIM)
+        if len(status) + len(hint) + 2 < width:
+            self._add(height - 2, width - len(hint) - 1, hint, self.c.A_DIM)
         if self.approval:
             record = self.approval
-            prompt = (f" [{record.get('kind')}] {record.get('detail')}  "
-                      f"[y]es [n]o [a]lways [esc]")
+            prompt = (f" approve [{record.get('kind')}] {record.get('detail')} · "
+                      f"y apply  n deny  a always")
             self._add(height - 1, 0, prompt[: width - 1], self._attr("yellow", self.c.A_BOLD))
         elif self.notice:
             self._add(height - 1, 0, self.notice[: width - 1], self._attr("yellow"))
@@ -5523,9 +6217,66 @@ class TuiApp:
                                           f"enrich {'on' if self.enrich else 'off'} · "
                                           f"stream {'on' if self.stream else 'off'}"
                                           f" · /help"[: width - 1], self.c.A_DIM)
-        if self.overlay:
+        if self.approval:
+            self._draw_approval(height, width)
+        elif self.overlay:
             self._draw_overlay(height, width)
         self.s.refresh()
+
+    def _approval_lines(self, preview: str) -> list[tuple[str, int]]:
+        lines: list[tuple[str, int]] = []
+        for raw in (preview or "(no preview)").splitlines():
+            if raw.startswith("+++") or raw.startswith("---"):
+                lines.append((raw, self.c.A_DIM))
+            elif raw.startswith("@@"):
+                lines.append((raw, self._attr("cyan")))
+            elif raw.startswith("+"):
+                lines.append((raw, self._attr("green")))
+            elif raw.startswith("-"):
+                lines.append((raw, self._attr("red")))
+            elif raw.startswith("\\"):
+                lines.append((raw, self.c.A_DIM))
+            else:
+                lines.append((raw, 0))
+        return lines or [("(no preview)", self.c.A_DIM)]
+
+    def _draw_approval(self, height: int, width: int) -> None:
+        record = self.approval or {}
+        title = f" [{record.get('kind')}] {record.get('detail')} "
+        lines = self._approval_lines(str(record.get("preview") or ""))
+        footer = " y apply   n deny   a always   esc deny   ↑↓ scroll "
+        box_h = min(max(len(lines) + 6, 10), height - 3)
+        widest = max([len(title), len(footer)] + [len(text) for text, _ in lines])
+        box_w = min(max(widest + 4, 46), width - 4)
+        top = max(1, (height - box_h) // 2)
+        left = max(1, (width - box_w) // 2)
+        scroll = int(record.get("scroll") or 0)
+        visible_rows = box_h - 6
+        scroll = max(0, min(scroll, max(0, len(lines) - visible_rows)))
+        record["scroll"] = scroll
+        border = self._attr("yellow", self.c.A_BOLD)
+        inner = box_w - 2
+        counter = (f" {scroll + 1}-{min(len(lines), scroll + visible_rows)}/{len(lines)} "
+                   if len(lines) > visible_rows else "")
+        self._add(top, left, "╭" + "─" * inner + "╮", border)
+        self._add(top + 1, left, "│", border)
+        self._add(top + 1, left + 2, title[: max(0, inner - 2 - len(counter))], border)
+        if counter:
+            self._add(top + 1, left + box_w - len(counter) - 1, counter, self.c.A_DIM)
+        self._add(top + 1, left + box_w - 1, "│", border)
+        self._add(top + 2, left, "├" + "─" * inner + "┤", border)
+        for row in range(visible_rows):
+            pos = row + scroll
+            text, attr = lines[pos] if pos < len(lines) else ("", 0)
+            self._add(top + 3 + row, left, "│", border)
+            self._add(top + 3 + row, left + 1, " " * inner)
+            self._add(top + 3 + row, left + 2, text[: inner - 2], attr)
+            self._add(top + 3 + row, left + box_w - 1, "│", border)
+        self._add(top + box_h - 3, left, "├" + "─" * inner + "┤", border)
+        self._add(top + box_h - 2, left, "│", border)
+        self._add(top + box_h - 2, left + 2, footer[: inner - 2], self.c.A_DIM)
+        self._add(top + box_h - 2, left + box_w - 1, "│", border)
+        self._add(top + box_h - 1, left, "╰" + "─" * inner + "╯", border)
 
     def _command_matches(self) -> str:
         if not self.buffer.startswith("/") or " " in self.buffer:
@@ -5538,26 +6289,45 @@ class TuiApp:
         overlay = self.overlay or {}
         items = overlay.get("items") or []
         title = str(overlay.get("title") or "")
-        box_h = min(len(items) + 3, height - 4)
-        box_w = min(max([len(title)] + [len(str(i.get("label"))) for i in items] + [24]) + 4,
-                    width - 4)
+        footer = str(overlay.get("footer") or "↑↓ move · enter select · esc close")
+        box_h = min(len(items) + 6, height - 3)
+        box_w = min(max([len(title), len(footer)]
+                        + [len(str(i.get("label"))) for i in items] + [28]) + 4, width - 4)
         top = max(1, (height - box_h) // 2)
         left = max(1, (width - box_w) // 2)
-        self._add(top, left, "+" + "-" * (box_w - 2) + "+", self._attr("cyan"))
-        self._add(top + 1, left + 2, title[: box_w - 4], self._attr("cyan", self.c.A_BOLD))
+        border = self._attr("cyan")
+        inner = box_w - 2
+        self._add(top, left, "╭" + "─" * inner + "╮", border)
+        self._add(top + 1, left, "│", border)
+        self._add(top + 1, left + 2, title[: inner - 2], self._attr("cyan", self.c.A_BOLD))
+        self._add(top + 1, left + box_w - 1, "│", border)
+        self._add(top + 2, left, "├" + "─" * inner + "┤", border)
         index = int(overlay.get("index") or 0)
-        for row in range(box_h - 3):
-            pos = row
-            if len(items) > box_h - 3:
-                start = max(0, min(index - (box_h - 4) // 2, len(items) - (box_h - 3)))
-                pos = row + start
+        rows = max(1, box_h - 6)
+        start = 0
+        if len(items) > rows:
+            start = max(0, min(index - (rows - 1) // 2, len(items) - rows))
+        for row in range(rows):
+            pos = row + start
+            self._add(top + 3 + row, left, "│", border)
             if pos >= len(items):
-                break
+                self._add(top + 3 + row, left + 1, " " * inner)
+                self._add(top + 3 + row, left + box_w - 1, "│", border)
+                continue
             item = items[pos]
             attr = self.c.A_REVERSE if pos == index else 0
-            self._add(top + 2 + row, left + 1, " " * (box_w - 2), attr)
-            self._add(top + 2 + row, left + 2, str(item.get("label"))[: box_w - 4], attr)
-        self._add(top + box_h - 1, left, "+" + "-" * (box_w - 2) + "+", self._attr("cyan"))
+            self._add(top + 3 + row, left + 1, " " * inner, attr)
+            self._add(top + 3 + row, left + 2, str(item.get("label"))[: inner - 2], attr)
+            self._add(top + 3 + row, left + box_w - 1, "│", border)
+        self._add(top + box_h - 2, left, "├" + "─" * inner + "┤", border)
+        self._add(top + box_h - 1, left, "│", border)
+        self._add(top + box_h - 1, left + 2, footer[: inner - 2], self.c.A_DIM)
+        if len(items) > rows:
+            counter = f" {index + 1}/{len(items)} "
+            self._add(top + box_h - 1, left + max(2, box_w - len(counter) - 2),
+                      counter, self.c.A_DIM)
+        self._add(top + box_h - 1, left + box_w - 1, "│", border)
+        self._add(top + box_h, left, "╰" + "─" * inner + "╯", border)
 
 
     # -- main loop --------------------------------------------------------
@@ -5596,14 +6366,28 @@ class TuiApp:
             return self._overlay_key(key)
         if self.approval:
             char = key.lower() if isinstance(key, str) else ""
+            record = self.approval
+            if key == c.KEY_UP:
+                record["scroll"] = max(0, int(record.get("scroll") or 0) - 1)
+                return True
+            if key == c.KEY_DOWN:
+                record["scroll"] = int(record.get("scroll") or 0) + 1
+                return True
+            if key == c.KEY_PPAGE:
+                record["scroll"] = max(0, int(record.get("scroll") or 0) - 10)
+                return True
+            if key == c.KEY_NPAGE:
+                record["scroll"] = int(record.get("scroll") or 0) + 10
+                return True
             if char in {"y", "n", "a", "\x1b", "\x03"}:
-                record = self.approval
                 record["result"][0] = char in {"y", "a"}
                 if char == "a":
                     self.auto_approve = True
                 record["event"].set()
                 self.approval = None
-                self._warn("approved" if char in {"y", "a"} else "denied")
+                verdict = "applied" if char in {"y", "a"} else "denied"
+                self._say(f"[{record.get('kind')}] {record.get('detail')} — {verdict}")
+                self._warn(verdict)
             return True
         if key in {"\x04", "\x11"}:
             return False
@@ -5762,14 +6546,16 @@ class TuiApp:
                       content: str, skills: list[str]) -> None:
         payload = list(payload)  # agent_turn appends tool messages to its own copy
 
-        def approve(kind: str, detail: str) -> bool:
+        def approve(kind: str, detail: str, preview: str = "") -> bool:
             if self.auto_approve:
                 return True
-            record: dict[str, Any] = {"kind": kind, "detail": detail,
-                                      "event": threading.Event(), "result": [False]}
-            self.queue.put(("approve", record))
-            record["event"].wait(timeout=600)
-            return bool(record["result"][0])
+            with self.approval_lock:  # one prompt at a time, workers queue up
+                record: dict[str, Any] = {"kind": kind, "detail": detail,
+                                          "preview": preview, "scroll": 0,
+                                          "event": threading.Event(), "result": [False]}
+                self.queue.put(("approve", record))
+                record["event"].wait(timeout=600)
+                return bool(record["result"][0])
 
         def on_event(kind: str, data: dict[str, Any]) -> None:
             self.queue.put(("event", (kind, data)))
@@ -5778,12 +6564,17 @@ class TuiApp:
             result = agent_turn(payload, model=model, task_hint=task or "coding",
                                 max_rounds=self.max_rounds, approve=approve, on_event=on_event,
                                 allow_outside=self.allow_outside,
-                                temperature=self.temperature, max_tokens=self.max_tokens or None)
+                                temperature=self.temperature, max_tokens=self.max_tokens or None,
+                                ctx={"subagent_rounds": self.subagent_rounds,
+                                     "max_subagents": self.max_subagents},
+                                allow_subagents=self.subagents)
             self.queue.put(("done", (result.get("text") or "", result.get("meta") or {})))
         except RuntimeError as exc:
             self.queue.put(("error", str(exc)))
         except Exception as exc:  # noqa: BLE001 - shown in the UI
             self.queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        finally:
+            close_mcp_sessions()
 
     def _pump(self) -> None:
         while True:
@@ -5801,10 +6592,29 @@ class TuiApp:
                 event_kind, data = payload
                 if event_kind == "todos":
                     self.todos = [item for item in (data or []) if isinstance(item, dict)]
+                elif event_kind == "subagent_start":
+                    worker = int(data.get("worker") or 0)
+                    files = ", ".join(data.get("files") or []) or "no files"
+                    self.workers[worker] = {"task": str(data.get("task") or ""),
+                                            "files": files, "state": "running",
+                                            "changed": []}
+                    self.messages.append({"role": "info",
+                                          "content": f"++ worker {worker} started ({files})"})
+                elif event_kind == "subagent_done":
+                    worker = int(data.get("worker") or 0)
+                    entry = self.workers.setdefault(worker, {"task": "", "files": "",
+                                                            "changed": []})
+                    entry["state"] = "done" if data.get("ok") else "failed"
+                    entry["changed"] = [str(x) for x in (data.get("changed") or [])]
+                    bit = ", ".join(entry["changed"]) or "no changes"
+                    self.messages.append({"role": "info",
+                                          "content": f"++ worker {worker} {entry['state']} ({bit})"})
                 elif event_kind == "tool":
                     args = json.dumps(data.get("arguments") or {}, ensure_ascii=False)
+                    worker = data.get("worker")
+                    prefix = f"[w{worker}] " if worker else ""
                     self.messages.append({"role": "info",
-                                          "content": f"-> {data.get('name')} {args[:220]}"})
+                                          "content": f"{prefix}-> {data.get('name')} {args[:200]}"})
                 elif event_kind == "notice":
                     self._warn(str(data.get("message") or ""))
                 elif event_kind == "tool_result":
@@ -5917,6 +6727,20 @@ class TuiApp:
                         str(item.get("status")), "[ ]")
                     rows.append(f"{mark} {item.get('task')}")
                 self._say("\n".join(rows))
+        elif command == "/workers":
+            if not self.workers:
+                self._say("no workers yet - the agent spawns them for independent files")
+            else:
+                items = []
+                for number in sorted(self.workers):
+                    entry = self.workers[number]
+                    mark = {"running": "…", "done": "ok", "failed": "fail"}.get(
+                        str(entry.get("state")), "?")
+                    changed = ", ".join(entry.get("changed") or []) or entry.get("files") or "-"
+                    items.append({"label": f"w{number}  {mark:<4}  {changed}"})
+                self.overlay = {"kind": "text", "title": "Parallel workers",
+                                "items": items, "index": 0,
+                                "footer": "esc close · the transcript has each report"}
         elif command == "/agent":
             if value.lower() in {"off", "none", "router", "free"}:
                 self.agent_backend = None
@@ -7255,7 +8079,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("skills", help="list, inspect and install Agent Skills (SKILL.md)")
     p.add_argument("action", nargs="?", default="list",
-                   choices=["list", "show", "install", "remove", "path"])
+                   choices=["list", "show", "install", "install-defaults", "defaults",
+                            "sync", "remove", "path"])
     p.add_argument("target", nargs="?")
     p.add_argument("--search")
     p.add_argument("--json", action="store_true")
@@ -7263,8 +8088,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("mcp", help="manage and call MCP servers")
     p.add_argument("action", nargs="?", default="list",
-                   choices=["list", "add", "add-rea", "remove", "enable", "disable",
-                            "test", "tools", "call"])
+                   choices=["list", "add", "add-rea", "defaults", "remove", "enable",
+                            "disable", "test", "tools", "call"])
     p.add_argument("name", nargs="?")
     p.add_argument("tool", nargs="?")
     p.add_argument("--command")
@@ -7296,6 +8121,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto", action="store_true", help="approve agent writes and commands")
     p.add_argument("--no-tools", dest="no_tools", action="store_true",
                    help="start without coding tools")
+    p.add_argument("--no-subagents", dest="no_subagents", action="store_true",
+                   help="do not let the agent spawn parallel workers")
     p.add_argument("--no-save", action="store_true", help="do not write a transcript")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_chat)
@@ -7338,6 +8165,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tui", action="store_true")
     p.add_argument("--auto", action="store_true", help="approve agent writes and commands")
     p.add_argument("--no-tools", dest="no_tools", action="store_true")
+    p.add_argument("--no-subagents", dest="no_subagents", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_tui)
 
@@ -7351,6 +8179,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--auto", action="store_true", help="approve writes and commands")
     p.add_argument("--allow-outside", action="store_true", help="allow paths outside cwd")
+    p.add_argument("--no-subagents", dest="no_subagents", action="store_true",
+                   help="do not let the agent spawn parallel workers")
     p.add_argument("--skill", action="append", default=[])
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_agent)
@@ -7409,6 +8239,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-key", action="store_true", help="do not auto-generate a router key")
+    p.add_argument("--no-skills", action="store_true", help="do not install the default skill collections")
+    p.add_argument("--no-mcp", action="store_true", help="do not enable the default MCP servers")
     p.add_argument("--start", action="store_true", help="start the proxy after setup")
     p.set_defaults(func=cmd_setup)
 
@@ -7437,8 +8269,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     os.umask(0o077)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        # Bare `hyperrouter` opens the agent TUI, the way freebuff/opencode do.
+        raw = ["tui"]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     if args.command == "serve":
         config = load_config()
         args.host = args.host or str(config.get("server", {}).get("host") or "127.0.0.1")
