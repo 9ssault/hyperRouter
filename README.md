@@ -28,8 +28,13 @@ cd hyperRouter && ./install.sh        # ~/.local/bin, symlinks, then init
 still works:
 
 ```bash
-install -m 755 hyperrouter ~/.local/bin/hyperrouter && ln -sf hyperrouter ~/.local/bin/hyperRouter
+install -m 755 hyperrouter ~/.local/bin/hyperrouter
+cp -R hyperrouter_lib ~/.local/bin/hyperrouter_lib
+ln -sf hyperrouter ~/.local/bin/hyperRouter
 ```
+
+The script imports its helper package from a `hyperrouter_lib` directory next to
+it; `install.sh` copies both, and `hyperrouter update` refreshes both.
 
 You need Python 3.11+ (standard library only). Provider keys and local model
 servers are optional — keyless providers such as Pollinations and LLM7 work out of
@@ -243,6 +248,12 @@ for 30 seconds instead of rescanning on every keystroke.
 - **Web guard**: `web_fetch` accepts only http(s), resolves the hostname, refuses
   loopback/private/link-local/reserved addresses, and re-checks every redirect hop.
   Redirect chains cannot smuggle a request into `127.0.0.1` or a metadata service.
+- **Header hygiene**: inbound requests have `x-internal-*`, `x-admin-*`, `x-looper-*`,
+  `x-vsr-*` and `x-hyperrouter-internal-*` headers stripped before routing, so a
+  caller cannot claim to be an internal component.
+- **Refusal reporting**: when a model's answer opens with a refusal, the TUI and CLI
+  say so and suggest editing, retrying, or choosing another model. Nothing rewrites
+  the prompt or retries around the provider's decision.
 - **Verification**: after the agent changes files, it detects the project's checks
   (`pyproject.toml`/`pytest.ini` -> `python3 -m pytest -q`, `package.json` with a test
   script -> `npm test`, `Cargo.toml`, `go.mod`, or a `Makefile` test target) and runs
@@ -553,7 +564,7 @@ get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, coo
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t . -v   # 72 tests, offline, stdlib only
+python3 -m unittest discover -s tests -t . -v   # 80 tests, offline, stdlib only
 python3 -m compileall -q hyperrouter            # syntax gate
 ./install.sh --dry-run                          # what the installer would do
 bash -n contrib/hyperrouter.bash                # completion syntax
@@ -570,6 +581,12 @@ harness availability checks. CI runs the same suite on Python 3.11 and 3.13
 `pyproject.toml` is PEP 621 metadata for editors and scanners; it deliberately
 declares no console script because setuptools cannot ship the extension-less
 `hyperrouter` file as a module. `install.sh` is the supported install path.
+
+The first modules are extracted into `hyperrouter_lib/`: pure text/token/display
+helpers and defensive guards (header stripping, refusal detection). The script
+adds its own directory to `sys.path`, so a checkout and an installed copy both
+work; a lone copied script reports exactly what is missing. `install.sh`,
+`hyperrouter update` and `hyperrouter uninstall` all handle the package.
 
 ## The proxy
 

@@ -46,10 +46,17 @@ done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 src="${HYPERROUTER_SRC:-$script_dir/hyperrouter}"
+lib_src="$script_dir/hyperrouter_lib"
 
 if [ ! -f "$src" ]; then
   printf 'install.sh: cannot find %s\n' "$src" >&2
   printf 'Set HYPERROUTER_SRC to the path of the hyperrouter script.\n' >&2
+  exit 1
+fi
+
+if [ ! -d "$lib_src" ]; then
+  printf 'install.sh: cannot find %s\n' "$lib_src" >&2
+  printf 'The hyperrouter_lib directory must sit next to the script.\n' >&2
   exit 1
 fi
 
@@ -68,9 +75,13 @@ run() {
 printf '%s\n' "hyperRouter installer"
 printf '%s\n' "  source: $src"
 printf '%s\n' "  target: $BIN/hyperrouter"
+printf '%s\n' "  modules: $BIN/hyperrouter_lib"
 
 run mkdir -p "$BIN"
 run install -m 755 "$src" "$BIN/hyperrouter"
+run rm -rf "$BIN/hyperrouter_lib"
+run mkdir -p "$BIN/hyperrouter_lib"
+run install -m 644 "$lib_src"/*.py "$BIN/hyperrouter_lib/"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'would link: %s -> hyperrouter\n' "$BIN/hyperRouter"

@@ -30,4 +30,8 @@ jobs:
       - name: CLI answers --version
         run: |
           install -m 755 hyperrouter /tmp/hyperrouter
+          cp -R hyperrouter_lib /tmp/hyperrouter_lib
           /tmp/hyperrouter --version
+
+      - name: Installer dry run
+        run: ./install.sh --dry-run --no-init

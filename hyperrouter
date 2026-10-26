@@ -55,9 +55,34 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
+_LIB_DIR = Path(__file__).resolve().parent
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+try:
+    from hyperrouter_lib.guard import (
+        REFUSAL_NOTICE,
+        detect_refusal,
+        strip_internal_headers,
+    )
+    from hyperrouter_lib.text import (
+        _cap,
+        clip_display,
+        content_to_text,
+        display_width,
+        estimate_tokens,
+        human_count,
+        messages_to_text,
+        redact,
+    )
+except ImportError as exc:  # a copied script without its package
+    raise SystemExit(
+        f"hyperrouter: hyperrouter_lib is missing next to {Path(__file__).resolve()} "
+        f"({exc}). Re-run ./install.sh or copy the hyperrouter_lib directory too."
+    ) from exc
+
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -317,19 +342,6 @@ def die(message: str, code: int = 1) -> "NoReturn":
 
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
-
-
-def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, math.ceil(len(text) / 4))
-
-
-def redact(text: str) -> str:
-    text = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", text)
-    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+", r"\1***", text)
-    text = re.sub(r"(?i)(api[_-]?key[\"'=:\s]+)[A-Za-z0-9._-]{8,}", r"\1***", text)
-    return text
 
 
 def read_text(path: Path) -> str:
@@ -1903,35 +1915,6 @@ def prompt_summary(task: str, context: str = "", has_tools: bool = False,
 # ---------------------------------------------------------------------------
 
 
-def content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text") or ""))
-                elif item.get("type") == "image_url":
-                    parts.append("[image]")
-        return "\n".join(parts)
-    return str(content or "")
-
-
-def messages_to_text(messages: Any) -> str:
-    if not isinstance(messages, list):
-        return ""
-    parts = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = str(msg.get("role") or "user")
-        parts.append(f"{role}: {content_to_text(msg.get('content'))}")
-    return "\n".join(parts)
-
-
 def has_images(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -2563,6 +2546,7 @@ class RouterHandler:
         return False
 
     def do_GET(self) -> None:
+        strip_internal_headers(self.headers)
         path = self.path.split("?", 1)[0]
         if path in {"/", "/health", "/healthz"}:
             catalog = load_catalog()
@@ -2647,6 +2631,7 @@ class RouterHandler:
         self.send_json(404, {"error": {"message": "not found", "type": "not_found"}})
 
     def do_POST(self) -> None:
+        strip_internal_headers(self.headers)
         path = self.path.split("?", 1)[0]
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -5389,6 +5374,8 @@ def cmd_chat_plain(args: argparse.Namespace) -> int:
                 print(f"{colors['red']}error: {exc}{colors['reset']}")
                 return
             print(answer)
+            if detect_refusal(answer):
+                print(f"{colors['yellow']}({REFUSAL_NOTICE}){colors['reset']}")
             messages.append({"role": "user", "content": content})
             messages.append({"role": "assistant", "content": answer})
             write_entry("user", content)
@@ -5434,6 +5421,8 @@ def cmd_chat_plain(args: argparse.Namespace) -> int:
             messages.pop()
             print(f"{colors['red']}error: empty response from the free pool{colors['reset']}")
             return
+        if detect_refusal(answer):
+            print(f"{colors['yellow']}({REFUSAL_NOTICE}){colors['reset']}")
         messages.append({"role": "assistant", "content": answer})
         write_entry("user", content)
         write_entry("assistant", answer, meta)
@@ -5837,40 +5826,6 @@ def _tool_path(raw: Any, allow_outside: bool = False, root: Any = None) -> Path:
     if not allow_outside and path != base and base not in path.parents:
         raise ValueError(f"path is outside the working directory: {path}")
     return path
-
-
-def display_width(text: str) -> int:
-    width = 0
-    for char in str(text or ""):
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-    return width
-
-
-def clip_display(text: str, width: int) -> str:
-    """Trim a string to a display width without splitting wide characters."""
-    if width <= 0:
-        return ""
-    out: list[str] = []
-    used = 0
-    for char in str(text or ""):
-        if unicodedata.combining(char):
-            out.append(char)
-            continue
-        size = 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-        if used + size > width:
-            break
-        out.append(char)
-        used += size
-    return "".join(out)
-
-
-def _cap(text: str, limit: int = 12000) -> str:
-    text = str(text or "")
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... ({len(text) - limit} more characters)"
 
 
 def diff_preview(path: Path, before: str, after: str, context: int = 3) -> str:
@@ -6903,6 +6858,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
         print(json.dumps({"task": task, "result": result}, indent=2, default=str))
         return 0
     print("\n" + (result.get("text") or "(the model returned no text)"))
+    if detect_refusal(str(result.get("text") or "")):
+        print(f"({REFUSAL_NOTICE})")
     meta = result.get("meta") or {}
     if meta:
         print(f"\n[{PRODUCT}: {meta.get('provider')}/{meta.get('model')} · "
@@ -7941,6 +7898,9 @@ class TuiApp:
                 continue
             text, meta = payload
             self.stream_cache = None
+            if detect_refusal(str(text)):
+                meta = {**(meta or {}), "refused": True}
+                self._warn(REFUSAL_NOTICE)
             if not str(text).strip():
                 self.messages.append({"role": "info",
                                       "content": "error: empty response from the free pool"})
@@ -8352,6 +8312,8 @@ def cmd_route(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
     else:
         print(response_text(result))
+        if detect_refusal(response_text(result)):
+            print(f"({REFUSAL_NOTICE})", file=sys.stderr)
         router = result.get("x_agent_router") or {}
         if router:
             print(f"\n[{PRODUCT}: {router.get('provider')}/{router.get('model')} "
@@ -8916,15 +8878,6 @@ def cmd_accounts(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def human_count(value: float) -> str:
-    value = float(value or 0)
-    for unit in ("", "k", "M", "B"):
-        if abs(value) < 1000 or unit == "B":
-            return f"{value:.0f}" if unit == "" else f"{value:.1f}{unit}"
-        value /= 1000.0
-    return str(value)
-
-
 def sparkline(values: Sequence[float]) -> str:
     if not values:
         return ""
@@ -9157,6 +9110,9 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 def cmd_uninstall(args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
     targets = [script]
+    lib_dir = script.parent / "hyperrouter_lib"
+    if lib_dir.is_dir():
+        targets.append(lib_dir)
     for name in ("hyperRouter", "agent-router"):
         link = script.with_name(name)
         if link.is_symlink() or (link.exists() and link.resolve() == script):
@@ -9180,7 +9136,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             pass
     for path in targets:
         try:
-            path.unlink()
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
             print(f"removed {path}")
         except FileNotFoundError:
             pass
@@ -9842,6 +9801,11 @@ def cmd_update(args: argparse.Namespace) -> int:
         if source.is_file() and source.resolve() != target:
             backup(target)
             shutil.copy2(source, target)
+        lib_source = repo / "hyperrouter_lib"
+        if lib_source.is_dir():
+            lib_target = target.parent / "hyperrouter_lib"
+            shutil.rmtree(lib_target, ignore_errors=True)
+            shutil.copytree(lib_source, lib_target)
         report["updated"] = True
         try:
             report["new_version"] = re.search(r'^VERSION = "([^"]+)"',
