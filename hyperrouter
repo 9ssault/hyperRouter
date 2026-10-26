@@ -3092,7 +3092,11 @@ def dsh_foreign_items(text: str) -> str:
         match = re.match(r"(    )?- id:\s*(\S+)", chunk)
         if not match or match.group(2) in ours:
             continue
-        lines = [line[4:] if line.startswith("    ") else line for line in chunk.rstrip().splitlines()]
+        # Items that used to sit inside our `- insert:` list are indented four
+        # spaces; root items are not and must keep their indentation.
+        nested = chunk.startswith("    - id:")
+        lines = [(line[4:] if nested and line.startswith("    ") else line)
+                 for line in chunk.rstrip().splitlines()]
         foreign.append("\n".join(lines))
     return "\n".join(foreign)
 
