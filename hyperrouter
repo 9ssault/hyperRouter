@@ -680,6 +680,47 @@ CURATED_PROVIDERS: dict[str, dict[str, Any]] = {
         "routable": True, "source": "local",
         "free_tier": "Runs on your own machine",
     },
+    "kilo": {
+        "id": "kilo", "name": "Kilo Code Gateway",
+        "api": "https://api.kilo.ai/api/gateway",
+        "env": ["KILO_API_KEY"], "auth": "optional",
+        "routable": True, "source": "curated",
+        "free_tier": "Free models with no API key (200 requests/hour per IP)",
+        "docs": "https://kilo.ai/docs/gateway/authentication",
+    },
+    "ovhcloud": {
+        "id": "ovhcloud", "name": "OVHcloud AI Endpoints",
+        "api": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        "env": ["OVHCLOUD_API_KEY"], "auth": "none",
+        "routable": True, "source": "curated",
+        "free_tier": "Anonymous free tier, 2 requests/minute per IP per model",
+        "docs": "https://www.ovhcloud.com/en/public-cloud/ai-endpoints/catalog/",
+    },
+}
+
+# models.dev already lists some of these providers, but with stricter metadata
+# than reality: Kilo and OVHcloud serve free models without a key. Override the
+# fields that decide whether a keyless account is created and how it is labelled.
+CURATED_PROVIDER_OVERRIDES: dict[str, dict[str, Any]] = {
+    "kilo": {
+        "auth": "optional", "source": "curated",
+        "free_tier": "Free models with no API key (200 requests/hour per IP)",
+        "docs": "https://kilo.ai/docs/gateway/authentication",
+    },
+    "ovhcloud": {
+        "auth": "none", "source": "curated",
+        "free_tier": "Anonymous free tier, 2 requests/minute per IP per model",
+        "docs": "https://www.ovhcloud.com/en/public-cloud/ai-endpoints/catalog/",
+    },
+}
+
+# Models that older catalogue snapshots carried with names the provider does not
+# serve any more. They are routable on paper and just burn a fallback slot.
+CURATED_DROP_IDS: set[str] = {
+    "llm7/deepseek-r1-0528",
+    "llm7/gpt-4.1-nano-2025-04-14",
+    "llm7/gpt-4o-mini-2024-07-18",
+    "llm7/qwen2.5-coder-32b-instruct",
 }
 
 # provider, model, name, free_type, tos, context, max_output,
@@ -723,6 +764,38 @@ _CURATED_TABLE: list[tuple[Any, ...]] = [
     ("siliconflow", "THUDM/glm-4-9b-chat", "GLM 4 9B (SiliconFlow)", "zero-cost", "caution", 131072, 8192, False, False, False, 0.55, 0.9),
     ("siliconflow", "internlm/internlm2_5-7b-chat", "InternLM 2.5 7B (SiliconFlow)", "zero-cost", "caution", 32768, 4096, False, False, False, 0.5, 0.92),
     ("vllm", "*", "vLLM (discovered)", "keyless", "ok", 32768, 8192, True, False, False, 0.55, 0.75),
+    # Kilo Code Gateway: free pool, no API key, 200 requests/hour per IP.
+    ("kilo", "kilo-auto/free", "Kilo Auto (free)", "keyless", "caution", 256000, 32768, True, False, True, 0.80, 0.80),
+    ("kilo", "openrouter/free", "OpenRouter Free Router (Kilo)", "keyless", "caution", 200000, 32768, True, False, True, 0.78, 0.76),
+    ("kilo", "nvidia/nemotron-3.5-super-vl:free", "Nemotron 3.5 Super VL (free)", "keyless", "caution", 1000000, 131072, True, True, True, 0.84, 0.72),
+    ("kilo", "nvidia/nemotron-3-ultra-550b-a55b:free", "Nemotron 3 Ultra 550B (free)", "keyless", "caution", 1000000, 65536, True, False, True, 0.86, 0.68),
+    ("kilo", "reflection/beam-free", "Reflection Beam (free)", "keyless", "caution", 1048576, 131072, True, False, True, 0.80, 0.72),
+    ("kilo", "dots-studio/dots-3-note-preview:free", "Dots 3 Note Preview (free)", "keyless", "caution", 512000, 460800, True, True, True, 0.79, 0.72),
+    ("kilo", "poolside/laguna-s-2.1:free", "Poolside Laguna S 2.1 (free, code)", "keyless", "caution", 262144, 32768, True, False, True, 0.78, 0.74),
+    ("kilo", "cohere/north-mini-code:free", "Cohere North Mini Code (free)", "keyless", "caution", 256000, 64000, True, False, True, 0.77, 0.78),
+    ("kilo", "liquid/lfm-2.5-2.6b:free", "LFM 2.5 2.6B (free)", "keyless", "caution", 65536, 8192, True, False, True, 0.55, 0.92),
+    ("kilo", "nvidia/nemotron-3.5-lightning:free", "Nemotron 3.5 Lightning (free)", "keyless", "caution", 1000000, 65536, True, False, True, 0.76, 0.90),
+    ("kilo", "nvidia/nemotron-3-super-120b-a12b:free", "Nemotron 3 Super 120B (free)", "keyless", "caution", 262144, 235929, True, False, True, 0.80, 0.76),
+    ("kilo", "recursive/flint-v1.0:free", "Recursive Flint 1.0 (free, code)", "keyless", "caution", 262144, 235929, True, False, True, 0.76, 0.74),
+    ("kilo", "stealth/glyph-cluster", "Glyph Cluster (free, code)", "keyless", "caution", 256000, 256000, True, False, True, 0.75, 0.74),
+    ("kilo", "xingchen-agi/xing4.0-29b-a4b:free", "Xing 4.0 29B (free)", "keyless", "caution", 262144, 235929, True, False, True, 0.74, 0.78),
+    # OVHcloud AI Endpoints: anonymous free tier, no key, 2 requests/minute per model.
+    ("ovhcloud", "gpt-oss-120b", "GPT-OSS 120B (OVH)", "keyless", "ok", 131072, 32768, True, False, True, 0.84, 0.80),
+    ("ovhcloud", "gpt-oss-20b", "GPT-OSS 20B (OVH)", "keyless", "ok", 131072, 8192, True, False, True, 0.74, 0.90),
+    ("ovhcloud", "Mistral-Nemo-Instruct-2407", "Mistral Nemo (OVH)", "keyless", "ok", 65536, 65536, False, False, False, 0.62, 0.90),
+    ("ovhcloud", "Meta-Llama-3_3-70B-Instruct", "Llama 3.3 70B (OVH)", "keyless", "ok", 131072, 4096, False, False, False, 0.72, 0.84),
+    ("ovhcloud", "Qwen3.6-27B", "Qwen3.6 27B (OVH)", "keyless", "ok", 262144, 32768, True, True, False, 0.78, 0.82),
+    ("ovhcloud", "Qwen3.8-27B", "Qwen3.8 27B (OVH)", "keyless", "ok", 262144, 32768, True, True, False, 0.80, 0.82),
+    ("ovhcloud", "Qwen3.5-397B-A17B", "Qwen3.5 397B (OVH)", "keyless", "ok", 262144, 32768, True, True, False, 0.86, 0.68),
+    ("ovhcloud", "Qwen3.5-9B", "Qwen3.5 9B (OVH)", "keyless", "ok", 262144, 8192, True, True, False, 0.66, 0.90),
+    ("ovhcloud", "Mistral-Small-3.2-24B-Instruct-2506", "Mistral Small 3.2 (OVH)", "keyless", "ok", 131072, 4096, False, True, False, 0.70, 0.88),
+    ("ovhcloud", "Qwen2.5-VL-72B-Instruct", "Qwen2.5 VL 72B (OVH)", "keyless", "ok", 32768, 8192, False, True, False, 0.68, 0.84),
+    # LLM7 anonymous turbo pool: names the gateway actually serves today.
+    ("llm7", "gpt-oss:20b", "GPT-OSS 20B (LLM7)", "keyless", "caution", 128000, 8192, True, False, True, 0.68, 0.92),
+    ("llm7", "mistral-Nemo-Instruct-2407", "Mistral Nemo (LLM7)", "keyless", "caution", 128000, 8192, False, False, False, 0.60, 0.90),
+    ("llm7", "minimax-m2.7", "MiniMax M2.7 (LLM7)", "keyless", "caution", 180000, 16384, True, False, True, 0.80, 0.78),
+    ("llm7", "nemotron-3-nano:30b", "Nemotron 3 Nano 30B (LLM7)", "keyless", "caution", 1000000, 16384, True, False, True, 0.76, 0.86),
+    ("llm7", "codestral-latest", "Codestral (LLM7)", "keyless", "caution", 32000, 8192, True, False, False, 0.68, 0.88),
 ]
 
 
@@ -748,7 +821,13 @@ def merge_curated(catalog: dict[str, Any]) -> dict[str, Any]:
     for pid, meta in CURATED_PROVIDERS.items():
         if pid not in providers:
             providers[pid] = copy.deepcopy(meta)
+    for pid, overrides in CURATED_PROVIDER_OVERRIDES.items():
+        if pid in providers:
+            providers[pid].update(copy.deepcopy(overrides))
     models = catalog.setdefault("models", [])
+    if CURATED_DROP_IDS:
+        models[:] = [m for m in models
+                     if not (isinstance(m, dict) and str(m.get("id")) in CURATED_DROP_IDS)]
     known = {str(m.get("id")) for m in models if isinstance(m, dict)}
     for model in CURATED_MODELS:
         if model["id"] not in known:
@@ -9885,6 +9964,106 @@ def _merge_model_rows(models: dict[str, dict[str, Any]], incoming: Iterable[dict
     return added
 
 
+def _live_provider_models(provider: str) -> list[dict[str, Any]]:
+    """Read a provider's own /models list and keep its free/anonymous rows."""
+    url = models_url(provider)
+    if not url:
+        return []
+    headers = {"Accept": "application/json", "User-Agent": f"hyperrouter/{VERSION}"}
+    token = ""
+    if provider == "kilo":
+        token = env_value("KILO_API_KEY")
+    elif provider == "huggingface":
+        token = env_value("HF_TOKEN") or env_value("HUGGINGFACE_API_KEY")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    status, _, data = http_json("GET", url, headers=headers, timeout=20)
+    if status != 200:
+        return []
+    rows: list[dict[str, Any]] = []
+
+    def add(mid: str, name: str, context: int, max_out: int, tools: bool,
+            vision: bool, reason: bool, quality: float, speed: float,
+            tos: str = "caution") -> None:
+        if not mid:
+            return
+        rows.append({
+            "id": f"{provider}/{mid}", "provider": provider, "model": mid,
+            "name": name or mid, "free_type": "keyless", "monthly_tokens": 0,
+            "credit_tokens": 0, "tos": tos, "pool_key": provider,
+            "context": int(context or 32768), "max_output": int(max_out or 8192),
+            "tools": bool(tools), "vision": bool(vision), "reasoning": bool(reason),
+            "structured_output": True, "quality": float(quality), "speed": float(speed),
+            "routable": True, "unavailable_reason": "", "source": f"live:{provider}",
+        })
+
+    if provider == "pollinations":
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("name") or "")
+            if not mid:
+                continue
+            add(mid, str(item.get("description") or mid), 32768, 8192,
+                bool(item.get("tools")), bool(item.get("vision")),
+                bool(item.get("reasoning")), 0.62, 0.92, "caution")
+        return rows
+
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+
+    if provider == "kilo":
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "")
+            if not mid or not (item.get("isFree") or mid.endswith(":free")):
+                continue
+            params = {str(p) for p in (item.get("supported_parameters") or [])}
+            arch = item.get("architecture") or {}
+            top = item.get("top_provider") or {}
+            add(mid, str(item.get("name") or mid), int(item.get("context_length") or 0),
+                int(top.get("max_completion_tokens") or 0), "tools" in params,
+                "image" in (arch.get("input_modalities") or []), "reasoning" in params,
+                0.72, 0.80)
+        return rows
+
+    if provider == "ovhcloud":
+        skip = ("embed", "whisper", "tts", "stable-diffusion", "bge", "guard")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "")
+            low = mid.lower()
+            if not mid or any(word in low for word in skip):
+                continue
+            context = int(item.get("context_length") or 0)
+            if context <= 0:
+                continue
+            tools = any(word in low for word in ("gpt-oss", "qwen3", "mistral-small"))
+            vision = any(word in low for word in ("vl", "vision", "qwen3.", "mistral-small"))
+            reason = "gpt-oss" in low or "qwen3" in low
+            add(mid, mid, context, int(item.get("max_completion_tokens") or 0),
+                tools, vision, reason, 0.72, 0.84, "ok")
+        return rows
+
+    if provider == "llm7":
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("id") or "")
+            if not mid or str(item.get("tier") or "").lower() != "turbo":
+                continue
+            caps = item.get("capabilities") or {}
+            context = int((item.get("context_window") or {}).get("tokens") or 0)
+            add(mid, mid, context, 8192, bool(caps.get("tools")),
+                bool(caps.get("vision")), bool(caps.get("reasoning")), 0.70, 0.88)
+        return rows
+
+    return rows
+
+
 def refresh_catalog(quiet: bool = False) -> int:
     """Rebuild the catalog from every free source this router knows about."""
     def say(message: str) -> None:
@@ -9934,9 +10113,29 @@ def refresh_catalog(quiet: bool = False) -> int:
     curated_added = _merge_model_rows(models, CURATED_MODELS, update_free_type=True)
     for pid, meta in CURATED_PROVIDERS.items():
         providers.setdefault(pid, copy.deepcopy(meta))
+    for pid, overrides in CURATED_PROVIDER_OVERRIDES.items():
+        if pid in providers:
+            providers[pid].update(copy.deepcopy(overrides))
     report.append({"source": "curated", "rows": len(CURATED_MODELS), "added": curated_added,
                    "ok": True, "url": "built-in registry"})
     say(f"  {len(CURATED_MODELS)} curated models, {curated_added} new")
+
+    say("Refreshing keyless providers from their live model lists...")
+    for pid in ("kilo", "ovhcloud", "llm7", "pollinations"):
+        live_rows = _live_provider_models(pid)
+        if not live_rows:
+            report.append({"source": f"live:{pid}", "rows": 0, "added": 0, "ok": False,
+                           "url": models_url(pid)})
+            say(f"  {pid}: skipped")
+            continue
+        # Drop the provider's older rows: these providers changed model names
+        # and stale entries only burn a fallback slot with a 404.
+        for mid in [mid for mid, row in models.items() if row.get("provider") == pid]:
+            del models[mid]
+        added = _merge_model_rows(models, live_rows, update_free_type=True)
+        report.append({"source": f"live:{pid}", "rows": len(live_rows), "added": added,
+                       "ok": True, "url": models_url(pid)})
+        say(f"  {pid}: {len(live_rows)} free models, {added} new")
 
     data = {
         "schema": 2, "generated_at": utc_now(),
@@ -9949,6 +10148,8 @@ def refresh_catalog(quiet: bool = False) -> int:
              "url": "https://github.com/cheaper-inference/OmniRoute", "license": "MIT",
              "note": "free-tier type, quota and ToS risk"},
             {"name": "hyperrouter curated registry", "note": "providers missing from models.dev"},
+            {"name": "provider live /models",
+             "note": "Kilo, OVHcloud, LLM7 and Pollinations free rows"},
             {"name": "local endpoints", "note": "Ollama, llama.cpp, LM Studio, vLLM"},
         ],
         "refresh": report,
