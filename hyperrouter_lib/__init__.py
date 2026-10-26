@@ -5,6 +5,23 @@ tested and changed without editing the 10k-line router. `install.sh` copies this
 directory next to the installed script.
 """
 
+from .settings import (
+    DEFAULT_CONFIG,
+    SETTINGS_DOCS,
+    SETTINGS_SECTIONS,
+    SETTING_CHOICES,
+    STRATEGIES,
+    coerce_setting,
+    deep_delete,
+    deep_get,
+    deep_set,
+    flatten_config,
+    format_setting,
+    setting_entries,
+    setting_kind,
+    setting_value_text,
+    validate_setting,
+)
 from .text import (
     _cap,
     clip_display,
@@ -39,4 +56,19 @@ __all__ = [
     "REFUSAL_NOTICE",
     "detect_refusal",
     "strip_internal_headers",
+    "DEFAULT_CONFIG",
+    "SETTINGS_DOCS",
+    "SETTINGS_SECTIONS",
+    "SETTING_CHOICES",
+    "STRATEGIES",
+    "coerce_setting",
+    "deep_delete",
+    "deep_get",
+    "deep_set",
+    "flatten_config",
+    "format_setting",
+    "setting_entries",
+    "setting_kind",
+    "setting_value_text",
+    "validate_setting",
 ]

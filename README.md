@@ -581,7 +581,7 @@ get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, coo
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t . -v   # 80 tests, offline, stdlib only
+python3 -m unittest discover -s tests -t . -v   # 98 tests, offline, stdlib only
 python3 -m compileall -q hyperrouter            # syntax gate
 ./install.sh --dry-run                          # what the installer would do
 bash -n contrib/hyperrouter.bash                # completion syntax
@@ -590,8 +590,8 @@ bash -n contrib/hyperrouter.bash                # completion syntax
 The suite covers the diff/approval path, tool sandboxing and path escape, SSRF
 refusals, subagent overlap and isolation/conflict merging, verification success and
 failure, skill pinning, verify-command detection, display-width handling, TUI render
-caching and transcript filtering, retry rewinding, routing error explanations, and
-harness availability checks. CI runs the same suite on Python 3.11 and 3.13
+caching and transcript filtering, retry rewinding, routing error explanations,
+settings coercion/validation/docs, and harness availability checks. CI runs the same suite on Python 3.11 and 3.13
 (`.github/workflows/ci.yml`). Tests redirect HOME and XDG to a temp directory and set
 `HYPERROUTER_NO_MCP=1`, so they never touch your config or spawn a server.
 
@@ -600,8 +600,8 @@ declares no console script because setuptools cannot ship the extension-less
 `hyperrouter` file as a module. `install.sh` is the supported install path.
 
 The first modules are extracted into `hyperrouter_lib/`: pure text/token/display
-helpers, Anthropic Messages translation, and defensive guards (header stripping,
-refusal detection). The script
+helpers, the settings schema/defaults/validation, Anthropic Messages translation,
+and defensive guards (header stripping, refusal detection). The script
 adds its own directory to `sys.path`, so a checkout and an installed copy both
 work; a lone copied script reports exactly what is missing. `install.sh`,
 `hyperrouter update` and `hyperrouter uninstall` all handle the package.
