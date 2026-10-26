@@ -217,6 +217,9 @@ search box, the current value and the description of every setting, and an
 `Enter` editor for booleans, enums, numbers and JSON. Changes are validated and
 saved immediately; `chat.model` opens the same picker as `Ctrl+P`, which lists
 every routable model with a `● ready` / `○ add an account` / `◌ cooling` marker.
+A `•` marks a setting that differs from its default, `Ctrl+R` resets the
+selected setting, and the model picked in the picker is saved as `chat.model`
+so it survives a restart.
 
 Around the agent:
 
@@ -226,10 +229,10 @@ Around the agent:
 - `/undo-edit` restores the file from the most recent edit backup.
 - `/plan` is read-only mode; `/workers` shows worker state; `/tools` disables the loop.
 
-Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+S` settings, `Ctrl+R` retry the
-last message, `Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U` clear line,
-`Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help,
-`PgUp/PgDn` scroll. The TUI disables XON/XOFF while it runs, so `Ctrl+S` opens
+Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+S` or `F2` settings, `Ctrl+R`
+retry the last message, `Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U`
+clear line, `Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?`
+help, `PgUp/PgDn` scroll. The TUI disables XON/XOFF while it runs, so `Ctrl+S` opens
 settings instead of freezing output.
 The mouse wheel scrolls the transcript, and clicking a command or `@file` hint in
 the bottom row fills the input; overlay rows are clickable too.
@@ -237,8 +240,10 @@ the bottom row fills the input; overlay rows are clickable too.
 `/find <text>` hides non-matching turns (`/find` clears), and `/keys` lists every
 shortcut.
 
-The screen redraws at 25 fps only while a request is running; when idle it blocks on
-the keyboard, so a parked TUI uses no CPU. Rendered turns and the streaming buffer
+Network and email modules (`urllib`, `ssl`, `http.client`) are imported on first
+use, so `--help`, `settings`, catalog reads and the first TUI frame do not pay
+for the HTTP stack. The screen redraws at 25 fps only while a request is running;
+when idle it blocks on the keyboard, so a parked TUI uses no CPU. Rendered turns and the streaming buffer
 are cached per width, and `@file` completion walks the tree once and reuses the index
 for 30 seconds instead of rescanning on every keystroke.
 
@@ -269,6 +274,10 @@ for 30 seconds instead of rescanning on every keystroke.
   `verification` in `--json`. Pin it with
   `hyperrouter settings set agent.verify_command "make check"`, or disable the step
   with `agent.verify false`.
+- **No-route reporting**: when no account has quota, the router no longer says
+  "no free models". It reports how many free models are in the catalog, gives the
+  next steps (`hyperrouter connect`, a local server, `doctor`) and, as a last
+  resort, retries the least-cold account before failing.
 
 ## Chat
 

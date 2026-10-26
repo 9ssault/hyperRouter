@@ -1,6 +1,7 @@
 """TUI responsiveness helpers, retry/filter, routing errors and harness checks."""
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from tests.harness import hr
@@ -203,6 +204,26 @@ class SettingsBrowserTest(unittest.TestCase):
                      if entry["key"] == "chat.model")
         self.app._settings_apply(entry, "auto")
 
+    def test_picking_a_model_from_the_picker_persists_it(self):
+        self.app._open_model_picker()
+        index = next(i for i, item in enumerate(self.app.overlay["items"])
+                     if item["value"] == "auto-fast")
+        self.app._overlay_choose(index)
+        self.assertEqual(hr.load_config()["chat"]["model"], "auto-fast")
+        self.app._save_default_model("auto")
+
+    def test_changed_settings_are_marked_and_reset_with_ctrl_r(self):
+        self.app._open_settings()
+        items = self.app.overlay["items"]
+        index = next(i for i, entry in enumerate(items) if entry["key"] == "chat.color")
+        self.app.overlay["index"] = index
+        before = bool(hr.load_config()["chat"]["color"])
+        self.app._settings_key("\r")
+        self.assertTrue(items[index]["changed"])
+        self.app._settings_key("\x12")
+        self.assertEqual(hr.load_config()["chat"]["color"], before)
+        self.assertFalse(items[index]["changed"])
+
     def test_model_picker_lists_every_routable_model_not_only_live_ones(self):
         catalog = {"models": [
             {"id": "alpha/one", "provider": "alpha", "model": "one", "routable": True,
@@ -224,6 +245,48 @@ class SettingsBrowserTest(unittest.TestCase):
         self.assertGreater(len(items), 2)
         self.assertIn("no account added", next(item["label"] for item in items
                                                if item["value"] == "alpha/one"))
+
+
+class CoolingFallbackTest(unittest.TestCase):
+    def test_a_cooling_account_still_produces_a_candidate(self):
+        account = {"id": "acct-cooling", "provider": "alpha", "label": "test",
+                   "disabled": False, "quota": {}}
+        catalog = {"models": [{"id": "alpha/one", "provider": "alpha", "model": "one",
+                               "routable": True, "free_type": "recurring-daily",
+                               "context": 32000, "tos": "ok", "tools": True}]}
+        conn = hr.connect()
+        conn.execute("DELETE FROM health")
+        conn.execute("INSERT INTO health(account_id, cooldown_until) VALUES (?, ?)",
+                     (account["id"], (datetime.now(timezone.utc)
+                                      + timedelta(seconds=120)).isoformat()))
+        conn.commit()
+        conn.close()
+        original = (hr.load_catalog, hr.discover_accounts)
+        hr.load_catalog = lambda force=False: catalog
+        hr.discover_accounts = lambda config=None: [account]
+        try:
+            candidates = hr.pick_models("chat", limit=3)
+        finally:
+            hr.load_catalog, hr.discover_accounts = original
+            conn = hr.connect()
+            conn.execute("DELETE FROM health")
+            conn.commit()
+            conn.close()
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0]["model"]["id"], "alpha/one")
+
+    def test_empty_route_message_counts_the_catalog(self):
+        original = hr.load_catalog
+        hr.load_catalog = lambda force=False: {"models": [
+            {"id": "x/y", "routable": True, "free_type": "free"},
+            {"id": "x/z", "routable": True, "free_type": "discontinued"},
+        ]}
+        try:
+            message = hr.no_free_model_message()
+        finally:
+            hr.load_catalog = original
+        self.assertIn("1 free models are in the catalog", message)
+        self.assertIn("hyperrouter connect", message)
 
 
 class RetryTest(unittest.TestCase):
