@@ -1,11 +1,10 @@
-"""hyperRouter injection layer.
+"""hyperRouter injection layer — full stack for every free-tier provider.
 
 Composable jailbreak / compliance pipeline:
   transforms → provider profiles → streaming refusal detector →
   genetic synthesizer → retry loop → agent system override.
 
-Loaded by the main hyperrouter script when HYPERROUTER_INJECT=1
-or routing.inject is enabled in config.
+Enable: routing.inject true  OR  HYPERROUTER_INJECT=1
 """
 
 from .transforms import (
@@ -16,6 +15,11 @@ from .transforms import (
     json_contract,
     crescendo_seed,
     format_smuggle,
+    developer_override,
+    opposite_day,
+    xml_smuggle,
+    chain_of_utility,
+    dual_response,
     apply_transforms,
     ATTACK_PIPELINES,
     PRIMITIVES,
@@ -24,7 +28,7 @@ from .profiles import PROVIDER_PROFILES, get_profile
 from .detector import StreamRefusalDetector, is_refusal, REFUSAL_STEMS, COMPLIANCE_SIGNALS
 from .synthesizer import AttackGenome, AttackSynthesizer, ROUTE_SYNTHESIZERS, get_synthesizer
 from .dispatch import dispatch_with_injection, apply_pipeline
-from .agent import AGENT_OVERRIDE, build_agent_system_prompt
+from .agent import AGENT_OVERRIDE, AGENT_OVERRIDE_HARD, build_agent_system_prompt
 from .router_surface import strip_trusted_headers, ROUTING_TRIGGERS, apply_routing_trigger
 
 __all__ = [
@@ -35,6 +39,11 @@ __all__ = [
     "json_contract",
     "crescendo_seed",
     "format_smuggle",
+    "developer_override",
+    "opposite_day",
+    "xml_smuggle",
+    "chain_of_utility",
+    "dual_response",
     "apply_transforms",
     "ATTACK_PIPELINES",
     "PRIMITIVES",
@@ -51,6 +60,7 @@ __all__ = [
     "dispatch_with_injection",
     "apply_pipeline",
     "AGENT_OVERRIDE",
+    "AGENT_OVERRIDE_HARD",
     "build_agent_system_prompt",
     "strip_trusted_headers",
     "ROUTING_TRIGGERS",
