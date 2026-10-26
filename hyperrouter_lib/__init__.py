@@ -15,6 +15,7 @@ from .text import (
     messages_to_text,
     redact,
 )
+from .anthropic import anthropic_to_openai, openai_response_to_anthropic, response_message
 from .guard import (
     INTERNAL_HEADER_PREFIXES,
     REFUSAL_NOTICE,
@@ -31,6 +32,9 @@ __all__ = [
     "human_count",
     "messages_to_text",
     "redact",
+    "anthropic_to_openai",
+    "openai_response_to_anthropic",
+    "response_message",
     "INTERNAL_HEADER_PREFIXES",
     "REFUSAL_NOTICE",
     "detect_refusal",

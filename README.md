@@ -583,7 +583,8 @@ declares no console script because setuptools cannot ship the extension-less
 `hyperrouter` file as a module. `install.sh` is the supported install path.
 
 The first modules are extracted into `hyperrouter_lib/`: pure text/token/display
-helpers and defensive guards (header stripping, refusal detection). The script
+helpers, Anthropic Messages translation, and defensive guards (header stripping,
+refusal detection). The script
 adds its own directory to `sys.path`, so a checkout and an installed copy both
 work; a lone copied script reports exactly what is missing. `install.sh`,
 `hyperrouter update` and `hyperrouter uninstall` all handle the package.
