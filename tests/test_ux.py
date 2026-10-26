@@ -15,6 +15,16 @@ class FakeCurses:
     BUTTON1_CLICKED = 4
     BUTTON1_PRESSED = 8
     KEY_MOUSE = 409
+    KEY_UP = -1
+    KEY_DOWN = -2
+    KEY_PPAGE = -3
+    KEY_NPAGE = -4
+    KEY_HOME = -5
+    KEY_END = -6
+    KEY_LEFT = -7
+    KEY_RIGHT = -8
+    KEY_BACKSPACE = -9
+    KEY_ENTER = "\r"
     error = Exception
 
     @staticmethod
@@ -35,6 +45,13 @@ def fake_tui():
     app.busy = False
     app.stream_buf = ""
     app.spinner = 0
+    app.config = hr.load_config()
+    app.settings_cache = None
+    app.settings_sections = []
+    app._model_items_cache = None
+    app.click_targets = []
+    app.model = "auto"
+    app.notice = ""
     return app
 
 
@@ -110,6 +127,103 @@ class MouseAndClickTest(unittest.TestCase):
         self.assertEqual(app.model, "auto-coding")
         self.assertIsNone(app.overlay)
         self.assertTrue(warnings)
+
+
+class SettingsBrowserTest(unittest.TestCase):
+    def setUp(self):
+        self.app = fake_tui()
+        self.toasts = []
+        self.app._warn = self.toasts.append
+
+    def test_settings_are_grouped_and_explained(self):
+        self.app._open_settings()
+        self.assertIn("chat", self.app.settings_sections)
+        self.assertIn("agent", self.app.settings_sections)
+        entries = self.app.overlay["items"]
+        self.assertTrue(entries)
+        self.assertTrue(all(entry.get("doc") for entry in entries))
+        self.assertTrue(all(entry.get("section") == "chat" for entry in entries))
+        self.assertNotIn("accounts", {entry["key"] for entry in entries})
+
+    def test_typing_filters_across_sections_and_esc_returns(self):
+        self.app._open_settings()
+        for character in "sandbox":
+            self.app._settings_key(character)
+        hits = [entry["key"] for entry in self.app.overlay["items"]]
+        self.assertIn("agent.sandbox", hits)
+        self.assertNotIn("chat.stream", hits)
+        self.app._settings_key("\x15")
+        self.assertEqual(self.app.overlay["query"], "")
+        self.app._settings_key("\x1b")
+        self.assertIsNone(self.app.overlay)
+
+    def test_enter_toggles_a_boolean_and_saves_it(self):
+        self.app._open_settings()
+        items = self.app.overlay["items"]
+        index = next(i for i, entry in enumerate(items) if entry["key"] == "chat.stream")
+        self.app.overlay["index"] = index
+        before = bool(hr.load_config()["chat"]["stream"])
+        self.app._settings_key("\r")
+        self.assertEqual(hr.load_config()["chat"]["stream"], not before)
+        self.assertTrue(any("chat.stream" in toast for toast in self.toasts))
+        # Put the test config back so later tests see the defaults.
+        self.app._settings_apply(items[index], before)
+
+    def test_number_editor_writes_a_valid_value_and_keeps_editing_on_error(self):
+        self.app._open_settings()
+        items = self.app.overlay["items"]
+        index = next(i for i, entry in enumerate(items) if entry["key"] == "chat.history_limit")
+        self.app._settings_choose(index)
+        self.assertEqual(self.app.overlay["mode"], "edit")
+        self.app._settings_key("\x15")
+        for character in "1":
+            self.app._settings_key(character)
+        self.app._settings_key("\r")
+        self.assertEqual(self.app.overlay["mode"], "edit")  # 1 is below the minimum
+        self.app._settings_key("\x15")
+        for character in "25":
+            self.app._settings_key(character)
+        self.app._settings_key("\r")
+        self.assertEqual(hr.load_config()["chat"]["history_limit"], 25)
+        self.assertEqual(self.app.overlay["mode"], "list")
+        self.app._settings_apply(self.app._settings_selected(), 40)
+
+    def test_model_setting_opens_the_picker_and_saves_the_choice(self):
+        self.app._open_settings()
+        self.app.overlay["query"] = "chat.model"
+        self.app._settings_refilter()
+        self.app._settings_choose(0)
+        self.assertEqual(self.app.overlay["kind"], "model")
+        self.assertEqual(self.app.overlay.get("for_setting"), "chat.model")
+        index = next(i for i, item in enumerate(self.app.overlay["items"])
+                     if item["value"] == "auto-coding")
+        self.app._overlay_choose(index)
+        self.assertEqual(hr.load_config()["chat"]["model"], "auto-coding")
+        entry = next(entry for entry in hr.setting_entries(hr.load_config())
+                     if entry["key"] == "chat.model")
+        self.app._settings_apply(entry, "auto")
+
+    def test_model_picker_lists_every_routable_model_not_only_live_ones(self):
+        catalog = {"models": [
+            {"id": "alpha/one", "provider": "alpha", "model": "one", "routable": True,
+             "free_type": "recurring-daily", "context": 32000},
+            {"id": "beta/two", "provider": "beta", "model": "two", "routable": True,
+             "free_type": "keyless", "context": 16000},
+        ]}
+        original = (hr.load_catalog, hr.discover_accounts)
+        hr.load_catalog = lambda force=False: catalog
+        hr.discover_accounts = lambda config=None: []
+        try:
+            items = self.app._model_picker_items()
+        finally:
+            hr.load_catalog, hr.discover_accounts = original
+        values = {item["value"] for item in items}
+        self.assertIn("alpha/one", values)
+        self.assertIn("beta/two", values)
+        self.assertIn("auto", values)
+        self.assertGreater(len(items), 2)
+        self.assertIn("no account added", next(item["label"] for item in items
+                                               if item["value"] == "alpha/one"))
 
 
 class RetryTest(unittest.TestCase):

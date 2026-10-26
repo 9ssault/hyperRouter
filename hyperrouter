@@ -87,7 +87,7 @@ except ImportError as exc:  # a copied script without its package
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.8.1"
+VERSION = "2.8.2"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -1159,7 +1159,10 @@ def local_endpoint_up(provider: str, ttl: float = 15.0) -> bool:
 def available_accounts(model: dict[str, Any], config: dict[str, Any] | None = None,
                        conn: sqlite3.Connection | None = None,
                        accounts: list[dict[str, Any]] | None = None,
-                       usage_cache: dict[str, dict[str, int]] | None = None) -> list[dict[str, Any]]:
+                       usage_cache: dict[str, dict[str, int]] | None = None,
+                       health_cache: dict[str, dict[str, Any]] | None = None,
+                       model_health_cache: dict[tuple[str, str], dict[str, Any]] | None = None
+                       ) -> list[dict[str, Any]]:
     config = config or load_config()
     provider = str(model.get("provider") or "")
     if is_local_provider(provider) and not local_endpoint_up(provider):
@@ -1172,10 +1175,20 @@ def available_accounts(model: dict[str, Any], config: dict[str, Any] | None = No
         for acct in pool:
             if acct["provider"] != model["provider"] or acct.get("disabled"):
                 continue
-            health = health_for(acct["id"], conn)
+            if health_cache is not None:
+                health = health_cache.get(acct["id"]) or {
+                    "success": 0, "failure": 0, "latency_ms": 0.0,
+                    "cooldown_until": None, "last_used": None, "last_error": None}
+            else:
+                health = health_for(acct["id"], conn)
             if is_cooling(health):
                 continue
-            mhealth = model_health_for(acct["id"], str(model.get("model") or ""), conn)
+            upstream = str(model.get("model") or "")
+            if model_health_cache is not None:
+                mhealth = model_health_cache.get((acct["id"], upstream)) or {
+                    "success": 0, "failure": 0, "cooldown_until": None, "last_error": None}
+            else:
+                mhealth = model_health_for(acct["id"], upstream, conn)
             if is_cooling(mhealth):
                 continue
             quota = quota_state(acct, model, conn, usage=(
@@ -1638,6 +1651,11 @@ def pick_models(
         for acct in pool:
             accounts_by_provider.setdefault(str(acct["provider"]), []).append(acct)
         usage_cache = {acct["id"]: usage_for(acct["id"], conn) for acct in pool}
+        health_cache = {acct["id"]: health_for(acct["id"], conn) for acct in pool}
+        model_health_cache = {
+            (str(row["account_id"]), str(row["model"])): dict(row)
+            for row in conn.execute("SELECT * FROM model_health")
+        }
         for model in catalog.get("models") or []:
             if not isinstance(model, dict):
                 continue
@@ -1659,7 +1677,8 @@ def pick_models(
                     candidates.append({"model": model, "account": None, "score": 0.0,
                                        "reasons": ["no configured account"]})
                 continue
-            accounts = available_accounts(model, config, conn, provider_accounts, usage_cache)
+            accounts = available_accounts(model, config, conn, provider_accounts, usage_cache,
+                                          health_cache, model_health_cache)
             if not accounts:
                 if include_unavailable:
                     candidates.append({"model": model, "account": None, "score": 0.0,
@@ -3763,12 +3782,15 @@ SETTINGS_DOCS: dict[str, str] = {
     "chat.show_router_tag": "Print which free model answered",
     "chat.show_token_usage": "Print token counts after each answer",
     "chat.auto_enrich": "Enrich the first chat message automatically",
+    "chat.skills": "Skills loaded at the start of every chat",
     "agent.enabled": "Give the TUI coding tools (default on)",
     "agent.auto_approve": "Allow writes and commands without asking",
     "agent.max_rounds": "Tool rounds before the agent must summarise",
     "agent.allow_outside": "Allow file tools outside the working directory",
     "agent.tool_result_chars": "How much tool output is kept in context",
     "mcp.agent": "Give the agent the tools of every enabled MCP server",
+    "mcp.timeout_seconds": "Seconds to wait for one MCP server call",
+    "mcp.max_tool_rounds": "MCP tool rounds allowed in one agent turn",
     "agent.sandbox": "auto: run commands in bubblewrap when it is installed",
     "agent.sandbox_network": "Let sandboxed commands reach the network",
     "agent.approvals.write": "Ask before write_file (false = always allow)",
@@ -3777,6 +3799,7 @@ SETTINGS_DOCS: dict[str, str] = {
     "agent.approvals.mcp_write": "Ask before MCP tools that are not read-only",
     "agent.verify": "Run the project's tests after the agent edits files",
     "agent.verify_command": "Command used for verification (empty = auto-detect)",
+    "agent.verify_timeout": "Seconds allowed for the verification command",
     "agent.subagent_isolation": "Run each worker in its own scratch copy, then merge",
     "agent.subagents": "Let the agent fan work out to parallel workers",
     "agent.max_subagents": "Parallel workers per subagent call",
@@ -3784,6 +3807,8 @@ SETTINGS_DOCS: dict[str, str] = {
     "ui.tui": "Use the full-screen TUI for interactive chat",
     "usage.window_days": "Default lookback window for `hyperrouter usage`",
     "usage.rows": "Default number of rows in usage tables",
+    "skills.auto_load": "Skill collections loaded automatically",
+    "skills.catalog_in_prompt": "Include the skill catalog in the system prompt",
     "ui.color": "Colorize CLI output",
     "ui.unicode": "Use unicode tables and sparklines",
     "prompt.persona": "Default persona file/name for prompt building",
@@ -3896,9 +3921,81 @@ def validate_setting(key: str, value: Any) -> None:
         raise ValueError(f"routing.strategy: choose one of {', '.join(STRATEGIES)}")
     if key in {"chat.model"} and not str(value).strip():
         raise ValueError("chat.model: must not be empty")
+    if key == "agent.sandbox" and value not in {"auto", "bwrap", "none", ""}:
+        raise ValueError("agent.sandbox: choose auto, bwrap or none")
 
 
 STRATEGIES = ("balanced", "quality", "speed", "cheap", "round-robin", "least-used")
+
+# Order used by the TUI settings screen. Secrets and per-account data never
+# appear there: accounts/providers are managed by `hyperrouter accounts`.
+SETTINGS_SECTIONS = ("chat", "agent", "routing", "ui", "usage",
+                     "server", "prompt", "mcp", "skills")
+SETTING_CHOICES: dict[str, tuple[str, ...]] = {
+    "routing.strategy": STRATEGIES,
+    "agent.sandbox": ("auto", "bwrap", "none"),
+}
+
+
+def setting_kind(key: str, value: Any, default: Any) -> str:
+    """What kind of editor a setting needs in the TUI."""
+    if key == "chat.model":
+        return "model"
+    if key in SETTING_CHOICES:
+        return "enum"
+    if key == "routing.task_models":
+        return "json"
+    sample = default if default is not _MISSING else value
+    if isinstance(sample, bool):
+        return "bool"
+    if isinstance(sample, (int, float)):
+        return "number"
+    if isinstance(sample, (dict, list)):
+        return "json"
+    return "text"
+
+
+def setting_value_text(entry: dict[str, Any], limit: int = 40) -> str:
+    value = entry.get("value", _MISSING)
+    if value is _MISSING:
+        return "(unset)"
+    if entry.get("kind") == "bool":
+        return "on" if value else "off"
+    text = format_setting(value)
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)] + "…"
+    return text
+
+
+def setting_entries(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the config into one row per editable setting, with docs."""
+    current = flatten_config(config)
+    defaults = flatten_config(copy.deepcopy(DEFAULT_CONFIG))
+    order = {name: index for index, name in enumerate(SETTINGS_SECTIONS)}
+    entries: list[dict[str, Any]] = []
+    for key in set(current) | set(defaults):
+        section = key.split(".")[0]
+        if section not in order:
+            continue
+        if key in {"mcp.servers"} or key.startswith("mcp.servers."):
+            continue
+        value = current.get(key, _MISSING)
+        default = defaults.get(key, _MISSING)
+        kind = setting_kind(key, value, default)
+        entry = {
+            "key": key,
+            "value": value,
+            "default": default,
+            "kind": kind,
+            "section": section,
+            "doc": SETTINGS_DOCS.get(key, ""),
+        }
+        entry["label"] = f"{key} = {setting_value_text(entry, 48)}"
+        entry["search"] = " ".join((key, entry["doc"], section,
+                                     setting_value_text(entry, 60))).lower()
+        entries.append(entry)
+    entries.sort(key=lambda item: (order[item["section"]], item["key"]))
+    return entries
 
 
 def cmd_settings(args: argparse.Namespace) -> int:
@@ -4156,6 +4253,14 @@ def cmd_models(args: argparse.Namespace) -> int:
         return 0
     print(f"Task: {task}  strategy: {args.strategy or load_config().get('routing', {}).get('strategy')}")
     print_candidates(candidates)
+    if not args.all and len(candidates) < 3:
+        total = sum(1 for model in (load_catalog().get("models") or [])
+                    if isinstance(model, dict) and model.get("routable")
+                    and str(model.get("free_type") or "") != "discontinued")
+        print(f"\n{len(candidates)} model(s) have a configured live account; "
+              f"{max(0, total - len(candidates))} more routable free models are in the catalog.")
+        print("`hyperrouter models --all` lists them with what each one needs, "
+              "or press Ctrl+P in the TUI.")
     if args.explain and candidates:
         print("\nScoring breakdown:")
         print(f"{'#':>2} {'model':<44} {'score':>6} {'fit':>5} {'quota':>5} {'health':>6} "
@@ -5385,10 +5490,15 @@ def cmd_chat_plain(args: argparse.Namespace) -> int:
                 got = deep_get(load_config(), value.split("."))
                 print(f"{value} = {format_setting(got)}")
             else:
-                flat = flatten_config(load_config())
-                for key in sorted(flat):
-                    if key.startswith(("chat.", "routing.")):
-                        print(f"  {key:<32} {format_setting(flat[key])}")
+                section = ""
+                for entry in setting_entries(load_config()):
+                    if entry["section"] != section:
+                        section = entry["section"]
+                        print(f"\n[{section}]")
+                    print(f"  {entry['key']:<30} {setting_value_text(entry, 24):<24} "
+                          f"{entry.get('doc') or ''}")
+                print("\nUse `hyperrouter settings set <key> <value>`, or Ctrl+S in the TUI "
+                      "for an editable browser.")
         elif command == "/sources":
             cmd_sources(argparse.Namespace(json=False))
         elif command == "/save":
@@ -6738,7 +6848,7 @@ TUI_HELP = [
     ("Ctrl+P", "pick a free model"),
     ("Ctrl+O", "usage for this machine"),
     ("Ctrl+U", "clear the input line"),
-    ("Ctrl+S", "settings summary"),
+    ("Ctrl+S", "settings browser (search, edit, save)"),
     ("Ctrl+K", "start a new conversation"),
     ("Ctrl+C", "cancel a running request"),
     ("Ctrl+R", "retry the last message"),
@@ -6766,6 +6876,7 @@ TUI_HELP = [
     ("/skills", "list installed skills"),
     ("/mcp", "MCP servers and tools"),
     ("/usage", "usage report"),
+    ("/settings", "settings browser (same as Ctrl+S)"),
     ("/compact", "summarize the conversation"),
     ("/export", "save the conversation as markdown"),
     ("/session", "show the session file"),
@@ -6870,11 +6981,28 @@ class TuiApp:
         self.quitting = False
         self.spinner = 0
         self.pairs: dict[str, int] = {}
+        self.settings_cache: list[dict[str, Any]] | None = None
+        self.settings_sections: list[str] = []
+        self._model_items_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._term_attrs: tuple[int, Any] | None = None
         self._setup_screen()
 
     # -- setup ------------------------------------------------------------
 
     def _setup_screen(self) -> None:
+        # Ctrl+S is XOFF in a normal terminal: without this the key is swallowed
+        # by the tty line discipline and the screen freezes instead of opening
+        # the settings overlay. Turn software flow control off for this session.
+        try:
+            import termios
+            fd = sys.stdin.fileno()
+            attrs = termios.tcgetattr(fd)
+            self._term_attrs = (fd, attrs)
+            raw = list(attrs)
+            raw[0] &= ~(termios.IXON | termios.IXOFF)
+            termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+        except (ImportError, AttributeError, OSError, ValueError):
+            self._term_attrs = None
         try:
             self.c.curs_set(1)
         except self.c.error:
@@ -7120,8 +7248,8 @@ class TuiApp:
         if running:
             segments.append(f"{running} worker{'s' if running != 1 else ''} running")
         status = " " + "  │  ".join(segments)
-        hint = ("Enter send · ^P model · ^R retry · ^F find · ^O usage · ? help · ^D quit"
-                if width > 92 else "^P model · ^D quit")
+        hint = ("Enter send · ^P model · ^S settings · ^R retry · ^F find · ^O usage · ? help · ^D quit"
+                if width > 104 else "^P model · ^S settings · ^D quit")
         self._add(height - 2, 0, status[: width - 1], self.c.A_DIM)
         if len(status) + len(hint) + 2 < width:
             self._add(height - 2, width - len(hint) - 1, hint, self.c.A_DIM)
@@ -7227,9 +7355,15 @@ class TuiApp:
 
     def _draw_overlay(self, height: int, width: int) -> None:
         overlay = self.overlay or {}
+        if overlay.get("kind") == "settings":
+            self._draw_settings_overlay(height, width)
+            return
         items = overlay.get("items") or []
         title = str(overlay.get("title") or "")
-        footer = str(overlay.get("footer") or "↑↓ move · enter select · esc close")
+        query = str(overlay.get("query") or "")
+        if query:
+            title = f"{title} [{query}]"
+        footer = str(overlay.get("footer") or "↑↓ move · type to filter · enter select · esc close")
         box_h = min(len(items) + 6, height - 3)
         box_w = min(max([len(title), len(footer)]
                         + [len(str(i.get("label"))) for i in items] + [28]) + 4, width - 4)
@@ -7274,32 +7408,144 @@ class TuiApp:
         self._add(top + box_h - 1, left + box_w - 1, "│", border)
         self._add(top + box_h, left, "╰" + "─" * inner + "╯", border)
 
+    def _draw_settings_overlay(self, height: int, width: int) -> None:
+        """Full-height settings browser: sections, search, docs and an editor."""
+        overlay = self.overlay or {}
+        items = overlay.get("items") or []
+        query = str(overlay.get("query") or "")
+        section = str(overlay.get("section") or "")
+        index = int(overlay.get("index") or 0)
+        mode = str(overlay.get("mode") or "list")
+        if height < 14 or width < 40:
+            self._add(0, 0, "enlarge the terminal to edit settings (need 40x14)",
+                      self._attr("yellow", self.c.A_BOLD))
+            return
+        box_h = min(height - 2, 22)
+        box_w = min(width - 2, 108)
+        top = max(0, (height - box_h) // 2)
+        left = max(0, (width - box_w) // 2)
+        inner = box_w - 2
+        border = self._attr("cyan")
+        for row in range(box_h):
+            self._add(top + row, left + 1, " " * inner)
+        self._add(top, left, "╭" + "─" * inner + "╮", border)
+        title = f" Settings {len(items)} "
+        self._add(top + 1, left, "│", border)
+        self._add(top + 1, left + 2, title[: inner - 2], self._attr("cyan", self.c.A_BOLD))
+        hint = "search: " + (query if query else "type to filter") + " "
+        self._add(top + 1, left + box_w - len(hint) - 1, hint[: inner - 2], self.c.A_DIM)
+        self._add(top + 1, left + box_w - 1, "│", border)
+        # Section tabs. Left/Right (or Tab) moves between them.
+        self._add(top + 2, left, "│", border)
+        self._add(top + 2, left + 1, " " * inner)
+        col = left + 2
+        for name in self.settings_sections:
+            label = f" {name} "
+            if col + len(label) >= left + box_w - 1:
+                break
+            attr = (self.c.A_REVERSE | self.c.A_BOLD) if name == section else self.c.A_DIM
+            self._add(top + 2, col, label, attr)
+            self.click_targets.append((top + 2, col, col + len(label) - 1,
+                                       ("settings_section", name)))
+            col += len(label) + 1
+        self._add(top + 2, left + box_w - 1, "│", border)
+        self._add(top + 3, left, "├" + "─" * inner + "┤", border)
+        key_w = max(16, min(27, inner // 3))
+        val_w = max(8, min(14, inner // 6))
+        doc_w = max(8, inner - key_w - val_w - 6)
+        self._add(top + 4, left + 2,
+                  f"  {'setting':<{key_w}} {'value':<{val_w}} what it does"[: inner - 2],
+                  self._attr("cyan", self.c.A_DIM))
+        rows = box_h - 10
+        start = 0
+        if len(items) > rows:
+            start = max(0, min(max(0, index) - (rows - 1) // 2, len(items) - rows))
+        for offset in range(rows):
+            pos = start + offset
+            row = top + 5 + offset
+            self._add(row, left, "│", border)
+            if pos >= len(items):
+                self._add(row, left + 1, " " * inner)
+                self._add(row, left + box_w - 1, "│", border)
+                continue
+            entry = items[pos]
+            selected = pos == index
+            attr = self.c.A_REVERSE if selected else 0
+            self._add(row, left + 1, " " * inner, attr)
+            marker = "▸" if selected else " "
+            key_text = str(entry.get("key"))[:key_w]
+            val_text = setting_value_text(entry, val_w)
+            doc = str(entry.get("doc") or "")
+            line = f" {marker} {key_text:<{key_w}} {val_text:<{val_w}} {doc[:doc_w]}"
+            self._add(row, left + 1, line[: inner], attr)
+            self.click_targets.append((row, left + 1, left + box_w - 2,
+                                       ("settings_row", pos)))
+            self._add(row, left + box_w - 1, "│", border)
+        self._add(top + 5 + rows, left, "├" + "─" * inner + "┤", border)
+        detail_row = top + 6 + rows
+        entry = items[index] if items and 0 <= index < len(items) else None
+        if mode == "edit" and entry is not None:
+            prompt = f" editing {entry.get('key')} · {str(overlay.get('draft') or '')}▏"
+            self._add(detail_row, left + 2, prompt[: inner - 2],
+                      self._attr("yellow", self.c.A_BOLD))
+            self._add(detail_row + 1, left + 2,
+                      "enter save · esc cancel · backspace delete"[: inner - 2], self.c.A_DIM)
+        elif entry is not None:
+            doc = str(entry.get("doc") or "") or "No description yet."
+            self._add(detail_row, left + 2, doc[: inner - 2], 0)
+            default = entry.get("default", _MISSING)
+            kind = str(entry.get("kind") or "text")
+            hint = (f"{kind} · default: {format_setting(default)}"
+                    if default is not _MISSING else kind)
+            if kind == "enum":
+                hint += " · choices: " + ", ".join(SETTING_CHOICES.get(str(entry.get('key')), ()))
+            self._add(detail_row + 1, left + 2, hint[: inner - 2], self.c.A_DIM)
+        else:
+            self._add(detail_row, left + 2, "no setting matches this search"[: inner - 2],
+                      self.c.A_DIM)
+        footer = (" ↑↓ move · ←→ section · enter edit · type to search · esc close "
+                  if mode == "list" else " enter save · esc cancel ")
+        flash = str(overlay.get("flash") or "")
+        if flash and mode == "list":
+            footer = f" ✓ {flash} "
+        self._add(top + box_h - 2, left, "│", border)
+        self._add(top + box_h - 2, left + 2, footer[: inner - 2], self.c.A_DIM)
+        if len(items) > rows and items:
+            counter = f" {min(index + 1, len(items))}/{len(items)} "
+            self._add(top + box_h - 2, left + box_w - len(counter) - 1, counter, self.c.A_DIM)
+        self._add(top + box_h - 2, left + box_w - 1, "│", border)
+        self._add(top + box_h - 1, left, "╰" + "─" * inner + "╯", border)
+
 
     # -- main loop --------------------------------------------------------
 
     def run(self) -> int:
-        while True:
-            self.spinner += 1
-            self._pump()
-            if self.notice and time.monotonic() > self.notice_until:
-                self.notice = ""
-            self._draw()
-            # Idle screens block on the keyboard instead of redrawing 12x a second.
-            active = self.busy or bool(self.notice)
-            self.s.timeout(40 if active else -1)
-            try:
-                key = self.s.get_wch()
-            except self.c.error:
-                continue
-            except KeyboardInterrupt:
-                key = "\x03"
-            if key == self.c.KEY_RESIZE:
-                continue
-            if key == getattr(self.c, "KEY_MOUSE", None):
-                self._mouse()
-                continue
-            if not self._key(key) or self.quitting:
-                break
+        try:
+            while True:
+                self.spinner += 1
+                self._pump()
+                if self.notice and time.monotonic() > self.notice_until:
+                    self.notice = ""
+                self._draw()
+                # Idle screens block on the keyboard instead of redrawing 12x a second.
+                active = self.busy or bool(self.notice)
+                self.s.timeout(40 if active else -1)
+                try:
+                    key = self.s.get_wch()
+                except self.c.error:
+                    continue
+                except KeyboardInterrupt:
+                    key = "\x03"
+                if key == self.c.KEY_RESIZE:
+                    continue
+                if key == getattr(self.c, "KEY_MOUSE", None):
+                    self._mouse()
+                    continue
+                if not self._key(key) or self.quitting:
+                    break
+        finally:
+            # Always hand software flow control back, even when the TUI raises.
+            self._restore_flow_control()
         try:
             self.c.mousemask(0)
         except (self.c.error, AttributeError):
@@ -7307,6 +7553,17 @@ class TuiApp:
         close_mcp_sessions()
         self._persist()
         return 0
+
+    def _restore_flow_control(self) -> None:
+        if self._term_attrs is None:
+            return
+        try:
+            import termios
+            fd, attrs = self._term_attrs
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        except (ImportError, OSError, ValueError):
+            pass
+        self._term_attrs = None
 
     def _say(self, text: str, role: str = "info") -> None:
         self.messages.append({"role": role, "content": text})
@@ -7349,6 +7606,16 @@ class TuiApp:
             return
         if kind == "overlay":
             self._overlay_choose(int(value))
+            return
+        if kind == "settings_section":
+            if self.overlay:
+                self.overlay["section"] = str(value)
+                self.overlay["query"] = ""
+                self.overlay["index"] = 0
+                self._settings_refilter()
+            return
+        if kind == "settings_row":
+            self._settings_choose(int(value))
 
     def _key(self, key: Any) -> bool:
         c = self.c
@@ -7810,12 +8077,16 @@ class TuiApp:
                 self._open_model_picker()
         elif command == "/models":
             task = normalize_task(value or self.task or "chat")
-            candidates = pick_models(task, limit=8, strategy=self.strategy)
-            rows = [f"Task: {task}"]
+            candidates = pick_models(task, limit=8, strategy=self.strategy,
+                                     include_unavailable=True)
+            ready = sum(1 for cand in candidates if cand.get("account"))
+            rows = [f"Task: {task} · {ready} ready now"]
             for index, cand in enumerate(candidates, 1):
-                rows.append(f"{index}. {cand['model']['id']}  ({cand.get('score', 0):.3f})")
-            if len(rows) == 1:
+                why = "ready" if cand.get("account") else "; ".join(cand.get("reasons") or [])[:44]
+                rows.append(f"{index}. {cand['model']['id']}  ({cand.get('score', 0):.3f}) · {why}")
+            if not candidates:
                 rows.append("no free model available right now")
+            rows.append("Ctrl+P opens the full picker (every routable model)")
             self._say("\n".join(rows))
         elif command == "/task":
             self.task = value
@@ -8002,21 +8273,366 @@ class TuiApp:
 
     # -- overlays ---------------------------------------------------------
 
-    def _open_model_picker(self) -> None:
-        items = [{"label": "auto - best free model for each task", "value": "auto"}]
+    def _model_picker_items(self) -> list[dict[str, Any]]:
+        """Every routable model, ready ones first, cached for 30 seconds.
+
+        Aliases and live models are shown together so the picker never hides a
+        model just because its provider has no credential yet: the marker and
+        the state explain what pressing Enter will do.
+        """
+        cached = getattr(self, "_model_items_cache", None)
+        if cached and time.time() - cached[0] < 30:
+            return cached[1]
+        items: list[dict[str, Any]] = [
+            {"label": "● auto · best free model for each task", "value": "auto",
+             "available": True, "search": "auto best free model task"}]
         for alias, desc in ALIAS_DESCRIPTIONS.items():
-            items.append({"label": f"{alias} - {desc}", "value": alias})
+            if alias == "auto":
+                continue
+            items.append({"label": f"● {alias} · {desc}", "value": alias,
+                          "available": True, "search": f"{alias} {desc}".lower()})
+        config = getattr(self, "config", None) or load_config()
         try:
-            for cand in pick_models(normalize_task(self.task or "chat"), limit=40,
-                                    strategy=self.strategy):
-                model = cand["model"]
-                items.append({"label": f"{model['id']}  ({model.get('free_type')}, "
-                                         f"{model.get('context')} ctx)",
-                              "value": model["id"]})
-        except Exception:  # noqa: BLE001 - picker still works with aliases
-            pass
-        self.overlay = {"kind": "model", "title": "Pick a free model",
-                        "items": items, "index": 0}
+            accounts = discover_accounts(config)
+        except Exception:  # noqa: BLE001 - the catalog is still useful without accounts
+            accounts = []
+        accounts = [acct for acct in accounts if not acct.get("disabled")]
+        accounts_by_provider: dict[str, list[dict[str, Any]]] = {}
+        for acct in accounts:
+            accounts_by_provider.setdefault(str(acct.get("provider")), []).append(acct)
+        conn = connect()
+        try:
+            account_health = {acct["id"]: health_for(acct["id"], conn) for acct in accounts}
+            model_health = {
+                (str(row["account_id"]), str(row["model"])): dict(row)
+                for row in conn.execute(
+                    "SELECT account_id, model, cooldown_until FROM model_health")
+            }
+        finally:
+            conn.close()
+        catalog = load_catalog()
+        rows = [m for m in catalog.get("models") or []
+                if isinstance(m, dict) and m.get("routable")
+                and str(m.get("free_type") or "") != "discontinued"]
+        cooling = {str(m.get("provider")): provider_cooling(str(m.get("provider")))
+                   for m in rows}
+        rows.sort(key=lambda m: (0 if accounts_by_provider.get(str(m.get("provider")))
+                                 and cooling.get(str(m.get("provider"))) == 0 else 1,
+                                 str(m.get("provider")), str(m.get("id"))))
+        for model in rows:
+            provider = str(model.get("provider") or "")
+            upstream = str(model.get("model") or "")
+            provider_accounts = accounts_by_provider.get(provider) or []
+            wait = cooling.get(provider, 0.0)
+            if not provider_accounts:
+                state, symbol = "no account added", "○"
+            elif wait > 0:
+                state, symbol = f"cooling {wait:.0f}s", "◌"
+            elif all(is_cooling(account_health.get(acct["id"], {}))
+                     or is_cooling(model_health.get((acct["id"], upstream), {}))
+                     for acct in provider_accounts):
+                state, symbol = "cooling", "◌"
+            else:
+                state, symbol = "ready", "●"
+            context = model.get("context")
+            ctx = f"{human_count(int(context))} ctx" if context else "ctx ?"
+            kind = str(model.get("free_type") or "free")
+            model_id = str(model.get("id") or "")
+            items.append({
+                "label": f"{symbol} {model_id} · {ctx} · {kind} · {state}",
+                "value": model_id,
+                "available": state == "ready",
+                "search": f"{model_id} {provider} {kind} {state} {ctx}".lower(),
+            })
+        self._model_items_cache = (time.time(), items)
+        return items
+
+    def _overlay_refilter(self) -> None:
+        if not self.overlay:
+            return
+        query = str(self.overlay.get("query") or "").strip().lower()
+        base = self.overlay.get("base_items") or []
+        if query:
+            hits = [item for item in base
+                    if query in str(item.get("search")
+                                    or f"{item.get('label')} {item.get('value')}").lower()]
+        else:
+            hits = list(base)
+        self.overlay["items"] = hits
+        self.overlay["index"] = 0
+
+    def _open_model_picker(self, for_setting: str | None = None) -> None:
+        items = self._model_picker_items()
+        ready = sum(1 for item in items if item.get("available"))
+        title = f"Models · {ready} ready"
+        if ready < len(items):
+            title += f" · {len(items) - ready} need an account"
+        self.overlay = {
+            "kind": "model", "title": title,
+            "items": items, "base_items": items, "index": 0, "query": "",
+            "for_setting": for_setting,
+            "footer": "● ready  ○ add an account  ◌ cooling · ↑↓ move · enter choose · esc",
+        }
+
+    def _open_settings(self, key: str = "") -> None:
+        config = getattr(self, "config", None) or load_config()
+        self.config = config
+        if key:
+            entries = {entry["key"]: entry for entry in setting_entries(config)}
+            entry = entries.get(key)
+            value = deep_get(config, key.split("."))
+            if value is _MISSING:
+                self._warn(f"unknown setting: {key}")
+                return
+            lines = [f"{key} = {format_setting(value)}"]
+            if entry:
+                lines.append(f"default: {format_setting(entry['default'])}")
+                if entry.get("doc"):
+                    lines.append(str(entry["doc"]))
+                lines.append(f"type: {entry['kind']} · edit with Ctrl+S")
+            self._say("\n".join(lines))
+            return
+        self.settings_cache = setting_entries(config)
+        self.settings_sections = [name for name in SETTINGS_SECTIONS
+                                  if any(entry["section"] == name
+                                         for entry in self.settings_cache)]
+        self.overlay = {
+            "kind": "settings", "title": "Settings", "items": [],
+            "base_items": self.settings_cache, "index": 0, "query": "",
+            "section": self.settings_sections[0] if self.settings_sections else "",
+            "mode": "list", "draft": "",
+        }
+        self._settings_refilter()
+
+    # -- settings browser --------------------------------------------------
+
+    def _settings_refilter(self, reset: bool = True) -> None:
+        if not self.overlay:
+            return
+        overlay = self.overlay
+        query = str(overlay.get("query") or "").strip().lower()
+        section = str(overlay.get("section") or "")
+        base = overlay.get("base_items") or []
+        if query:
+            hits = [entry for entry in base if query in str(entry.get("search") or "")]
+        else:
+            hits = [entry for entry in base if str(entry.get("section")) == section]
+            if not hits:
+                hits = list(base)
+        overlay["items"] = hits
+        if reset:
+            overlay["index"] = 0
+        else:
+            overlay["index"] = max(0, min(int(overlay.get("index") or 0),
+                                          max(0, len(hits) - 1)))
+
+    def _settings_section(self, delta: int) -> None:
+        if not self.overlay or not self.settings_sections:
+            return
+        current = str(self.overlay.get("section") or "")
+        try:
+            position = self.settings_sections.index(current)
+        except ValueError:
+            position = 0
+        section = self.settings_sections[(position + delta) % len(self.settings_sections)]
+        self.overlay["section"] = section
+        self.overlay["query"] = ""
+        self.overlay["index"] = 0
+        self._settings_refilter()
+
+    def _settings_selected(self) -> dict[str, Any] | None:
+        if not self.overlay:
+            return None
+        items = self.overlay.get("items") or []
+        index = int(self.overlay.get("index") or 0)
+        if not items:
+            return None
+        return items[max(0, min(index, len(items) - 1))]
+
+    def _settings_choose(self, position: int) -> None:
+        if not self.overlay:
+            return
+        items = self.overlay.get("items") or []
+        if not items:
+            return
+        position = max(0, min(position, len(items) - 1))
+        self.overlay["index"] = position
+        entry = items[position]
+        kind = str(entry.get("kind") or "text")
+        if kind == "bool":
+            self._settings_apply(entry, not bool(entry.get("value")))
+            return
+        if kind == "model":
+            self._open_model_picker(for_setting=str(entry.get("key") or "chat.model"))
+            return
+        if kind == "enum":
+            self.overlay["mode"] = "edit"
+            self.overlay["draft"] = str(entry.get("value") or "")
+            return
+        self.overlay["mode"] = "edit"
+        value = entry.get("value")
+        self.overlay["draft"] = "" if value is _MISSING else format_setting(value)
+
+    def _settings_apply(self, entry: dict[str, Any], value: Any) -> bool:
+        key = str(entry.get("key") or "")
+        if not key:
+            return False
+        try:
+            validate_setting(key, value)
+        except ValueError as exc:
+            self._warn(str(exc))
+            return False
+        config = getattr(self, "config", None) or load_config()
+        self.config = config
+        deep_set(config, key.split("."), value)
+        try:
+            save_config(config)
+        except OSError as exc:
+            self._warn(f"could not save {key}: {exc}")
+            return False
+        entry["value"] = value
+        entry["label"] = f"{key} = {setting_value_text(entry, 48)}"
+        entry["search"] = " ".join((key, str(entry.get("doc") or ""),
+                                     str(entry.get("section") or ""),
+                                     setting_value_text(entry, 60))).lower()
+        self._sync_setting(key, value)
+        self.settings_cache = None
+        message = f"saved {key} = {setting_value_text(entry)}"
+        self._warn(message)
+        if self.overlay and self.overlay.get("kind") == "settings":
+            self.overlay["flash"] = message
+        return True
+
+    def _sync_setting(self, key: str, value: Any) -> None:
+        """Keep the live TUI state in step with a setting changed in the overlay."""
+        if key == "chat.model":
+            self.model = str(value or "auto")
+        elif key == "chat.stream":
+            self.stream = bool(value)
+        elif key == "chat.auto_enrich":
+            self.enrich = bool(value)
+        elif key == "chat.history_limit":
+            self.history_limit = max(2, int(value or 40))
+        elif key == "chat.show_token_usage":
+            self.show_tokens = bool(value)
+        elif key == "agent.auto_approve":
+            self.auto_approve = bool(value)
+        elif key == "agent.max_rounds":
+            self.max_rounds = max(1, int(value or 8))
+        elif key == "agent.subagents":
+            self.subagents = bool(value)
+        elif key == "mcp.agent":
+            self.web_tools = bool(value)
+
+    def _settings_commit(self) -> None:
+        if not self.overlay:
+            return
+        entry = self._settings_selected()
+        if entry is None:
+            return
+        raw = str(self.overlay.get("draft") or "")
+        key = str(entry.get("key") or "")
+        kind = str(entry.get("kind") or "text")
+        default = entry.get("default", _MISSING)
+        try:
+            if kind == "json":
+                parsed = json.loads(raw) if raw.strip() else None
+                if not isinstance(parsed, (dict, list)):
+                    raise ValueError(f"{key}: expected JSON object or array")
+                value: Any = parsed
+            else:
+                value = coerce_setting(key, raw, "" if default is _MISSING else default)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._warn(str(exc))
+            return
+        if self._settings_apply(entry, value):
+            self.overlay["mode"] = "list"
+            self.overlay["draft"] = ""
+            self._settings_refilter(reset=False)
+
+    def _settings_key(self, key: Any) -> bool:
+        assert self.overlay is not None
+        c = self.c
+        overlay = self.overlay
+        mode = str(overlay.get("mode") or "list")
+        if key in {"\x1b", "\x03", "\x04"}:
+            if mode == "edit":
+                overlay["mode"] = "list"
+                overlay["draft"] = ""
+            else:
+                self.overlay = None
+            return True
+        if mode == "list" and overlay.get("flash"):
+            if key not in {"\n", "\r", getattr(c, "KEY_ENTER", "\r"), " "}:
+                overlay.pop("flash", None)
+        if mode == "edit":
+            entry = self._settings_selected()
+            draft = str(overlay.get("draft") or "")
+            if key in {"\n", "\r", getattr(c, "KEY_ENTER", "\r")}:
+                self._settings_commit()
+                return True
+            if key in {"\x08", getattr(c, "KEY_BACKSPACE", "\x08")}:
+                overlay["draft"] = draft[:-1]
+                return True
+            if key == "\x15":
+                overlay["draft"] = ""
+                return True
+            if entry is not None and entry.get("kind") == "enum":
+                choices = SETTING_CHOICES.get(str(entry.get("key")), ())
+                if key in {getattr(c, "KEY_LEFT", -1), getattr(c, "KEY_RIGHT", -1)}:
+                    if choices:
+                        try:
+                            position = choices.index(draft)
+                        except ValueError:
+                            position = -1 if key == getattr(c, "KEY_LEFT", -1) else 0
+                        step = -1 if key == getattr(c, "KEY_LEFT", -1) else 1
+                        overlay["draft"] = choices[(position + step) % len(choices)]
+                    return True
+            if isinstance(key, str) and key.isprintable():
+                overlay["draft"] = draft + key
+                return True
+            return True
+        items = overlay.get("items") or []
+        index = int(overlay.get("index") or 0)
+        if key == getattr(c, "KEY_UP", -1):
+            overlay["index"] = max(0, index - 1)
+            return True
+        if key == getattr(c, "KEY_DOWN", -1):
+            overlay["index"] = max(0, min(len(items) - 1, index + 1))
+            return True
+        if key == getattr(c, "KEY_PPAGE", -1):
+            overlay["index"] = max(0, index - 10)
+            return True
+        if key == getattr(c, "KEY_NPAGE", -1):
+            overlay["index"] = max(0, min(len(items) - 1, index + 10))
+            return True
+        if key == getattr(c, "KEY_HOME", -1):
+            overlay["index"] = 0
+            return True
+        if key == getattr(c, "KEY_END", -1):
+            overlay["index"] = max(0, len(items) - 1)
+            return True
+        if key in {getattr(c, "KEY_LEFT", -1), getattr(c, "KEY_RIGHT", -1), "\t"}:
+            delta = -1 if key == getattr(c, "KEY_LEFT", -1) else 1
+            self._settings_section(delta)
+            return True
+        if key in {"\n", "\r", getattr(c, "KEY_ENTER", "\r"), " "}:
+            if items:
+                self._settings_choose(index)
+            return True
+        if key in {"\x08", getattr(c, "KEY_BACKSPACE", "\x08")}:
+            overlay["query"] = str(overlay.get("query") or "")[:-1]
+            self._settings_refilter()
+            return True
+        if key == "\x15":
+            overlay["query"] = ""
+            self._settings_refilter()
+            return True
+        if isinstance(key, str) and key.isprintable():
+            overlay["query"] = str(overlay.get("query") or "") + key
+            self._settings_refilter()
+            return True
+        return True
 
     def _open_help(self) -> None:
         items = [{"label": f"{key:<12} {desc}"} for key, desc in TUI_HELP if key or desc]
@@ -8026,14 +8642,6 @@ class TuiApp:
     def _open_usage(self) -> None:
         self._open_text("Usage", lambda: cmd_usage(argparse.Namespace(
             days=7, by="provider", limit=8, provider=None, model=None, json=False)))
-
-    def _open_settings(self, key: str = "") -> None:
-        if key:
-            value = deep_get(load_config(), key.split("."))
-            self._say(f"{key} = {format_setting(value)}")
-            return
-        self._open_text("Settings", lambda: cmd_settings(argparse.Namespace(
-            action="show", key=None, value=None, yes=False, json=False)))
 
     def _open_text(self, title: str, func: Any) -> None:
         import contextlib
@@ -8051,22 +8659,39 @@ class TuiApp:
     def _overlay_key(self, key: Any) -> bool:
         assert self.overlay is not None
         kind = self.overlay.get("kind")
+        if kind == "settings":
+            return self._settings_key(key)
         items = self.overlay.get("items") or []
         index = int(self.overlay.get("index") or 0)
         if key in {"\x1b", "\x03", "\x04"}:
             self.overlay = None
             return True
         if kind == "model":
-            if key == self.c.KEY_UP:
-                self.overlay["index"] = max(0, index - 1)
-            elif key == self.c.KEY_DOWN:
-                self.overlay["index"] = min(len(items) - 1, index + 1)
-            elif key in {self.c.KEY_PPAGE}:
-                self.overlay["index"] = max(0, index - 10)
-            elif key in {self.c.KEY_NPAGE}:
-                self.overlay["index"] = min(len(items) - 1, index + 10)
-            elif key in {"\n", "\r", self.c.KEY_ENTER} and items:
-                self._overlay_choose(index)
+            if key in {self.c.KEY_UP, self.c.KEY_DOWN, self.c.KEY_PPAGE,
+                       self.c.KEY_NPAGE, "\n", "\r", self.c.KEY_ENTER}:
+                if key == self.c.KEY_UP:
+                    self.overlay["index"] = max(0, index - 1)
+                elif key == self.c.KEY_DOWN:
+                    self.overlay["index"] = min(len(items) - 1, index + 1)
+                elif key == self.c.KEY_PPAGE:
+                    self.overlay["index"] = max(0, index - 10)
+                elif key == self.c.KEY_NPAGE:
+                    self.overlay["index"] = min(len(items) - 1, index + 10)
+                elif items:
+                    self._overlay_choose(index)
+                return True
+            if key in {"\x08", getattr(self.c, "KEY_BACKSPACE", "\x08")}:
+                self.overlay["query"] = str(self.overlay.get("query") or "")[:-1]
+                self._overlay_refilter()
+                return True
+            if key == "\x15":
+                self.overlay["query"] = ""
+                self._overlay_refilter()
+                return True
+            if isinstance(key, str) and key.isprintable():
+                self.overlay["query"] = str(self.overlay.get("query") or "") + key
+                self._overlay_refilter()
+                return True
             return True
         if key in {"\n", "\r", self.c.KEY_ENTER}:
             self.overlay = None
@@ -8081,8 +8706,17 @@ class TuiApp:
             return
         item = items[max(0, min(len(items) - 1, position))]
         if self.overlay.get("kind") == "model":
-            self.model = str(item.get("value") or self.model)
-            self._warn(f"model: {self.model}")
+            value = str(item.get("value") or self.model)
+            target = self.overlay.get("for_setting")
+            if target:
+                entry = next((entry for entry in setting_entries(self.config)
+                              if entry.get("key") == target), None)
+                if entry is not None and self._settings_apply(entry, value):
+                    self.overlay = None
+                    return
+            self.model = value
+            suffix = "" if item.get("available", True) else " (no account yet - it may fail)"
+            self._warn(f"model: {self.model}{suffix}")
         self.overlay = None
 
 

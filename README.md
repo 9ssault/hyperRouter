@@ -212,6 +212,12 @@ mode, messages, context, tasks), and framed overlays for the model picker, usage
 settings and approvals. `Ctrl+L` redraws after a resize, and frames are measured in
 display columns, so emoji and CJK text no longer break borders.
 
+`Ctrl+S` (or `/settings`) opens an editable settings browser: section tabs, a
+search box, the current value and the description of every setting, and an
+`Enter` editor for booleans, enums, numbers and JSON. Changes are validated and
+saved immediately; `chat.model` opens the same picker as `Ctrl+P`, which lists
+every routable model with a `● ready` / `○ add an account` / `◌ cooling` marker.
+
 Around the agent:
 
 - `/image screenshot.png` queues a png/jpg/webp/gif as a data URL on the next
@@ -220,9 +226,11 @@ Around the agent:
 - `/undo-edit` restores the file from the most recent edit backup.
 - `/plan` is read-only mode; `/workers` shows worker state; `/tools` disables the loop.
 
-Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+R` retry the last message,
-`Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U` clear line, `Ctrl+K` new
-conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help, `PgUp/PgDn` scroll.
+Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+S` settings, `Ctrl+R` retry the
+last message, `Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U` clear line,
+`Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help,
+`PgUp/PgDn` scroll. The TUI disables XON/XOFF while it runs, so `Ctrl+S` opens
+settings instead of freezing output.
 The mouse wheel scrolls the transcript, and clicking a command or `@file` hint in
 the bottom row fills the input; overlay rows are clickable too.
 `/tools` turns the tools off for a plain chat, `/todos` shows the agent's task list,
