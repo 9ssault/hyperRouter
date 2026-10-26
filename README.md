@@ -1,9 +1,11 @@
 # hyperRouter
 
-One free-model router, one CLI, and a full chat client for OpenCode, Freebuff and
-DeepSeek Harness. It discovers free models across 150 providers, picks the best one
-per task, streams answers, tracks usage, loads Agent Skills, calls MCP servers, and
-exposes an OpenAI-compatible endpoint at `http://127.0.0.1:8787/v1`.
+A free-model router, a full-screen coding agent, and one CLI for OpenCode,
+Freebuff and DeepSeek Harness. It discovers free models across 150 providers,
+picks the best one per task, and gives the model real tools: read, write, edit,
+search, run commands, keep todos. It streams answers, tracks usage, loads Agent
+Skills, calls MCP servers, and exposes an OpenAI-compatible endpoint at
+`http://127.0.0.1:8787/v1`.
 
 It does **not** bypass provider limits. "Free" here means pooling the free tiers you
 already have (keyless endpoints, local models, signup credits, daily allowances),
@@ -29,7 +31,9 @@ the box.
 ```bash
 hyperrouter catalog --available          # what can run right now
 hyperrouter sources                      # where the catalog comes from
-hyperrouter chat                         # full interactive chat
+hyperrouter tui                          # full-screen agent (default for chat)
+hyperrouter agent "fix the failing test" # one-shot agent with tools
+hyperrouter chat                         # same TUI; --plain for a REPL
 hyperrouter chat "explain this traceback" --session debug
 hyperrouter route "summarize this" --model auto-coding
 hyperrouter delegate "1. design the schema 2. write the migration 3. review it"
@@ -63,10 +67,41 @@ hyperrouter doctor
 
 Keys are read from the environment only. The router never stores provider secrets.
 
+## Agent
+
+The TUI is an agent, not a chatbot. The model gets seven tools and a loop:
+
+| Tool | What it does |
+| --- | --- |
+| `read_file` | numbered lines, windowed |
+| `write_file` | create or overwrite (backup on overwrite) |
+| `edit_file` | exact single-match replace, like a patch |
+| `list_dir` | sorted entries |
+| `search` | ripgrep, with a Python fallback |
+| `run_command` | bash in the working directory, blocked-list guarded |
+| `todo` | the task list shown in the status bar |
+
+Writes, edits and commands ask `[y]es [n]o [a]lways` unless you pass `--auto` or set
+`agent.auto_approve`. Read-only tools never ask. Paths outside the working directory
+are refused unless `agent.allow_outside` is on. When a free tier answers with
+`Retry after 24s`, the loop waits and continues instead of dying.
+
+```bash
+hyperrouter tui --auto                      # trust this session
+hyperrouter agent "add tests for parser.py" --auto --max-rounds 12
+hyperrouter agent "why is this test flaky?" --json
+```
+
+Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+O` usage, `Ctrl+U` clear line,
+`Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help,
+`PgUp/PgDn` scroll. `/tools` turns the tools off for a plain chat, `/todos` shows
+the agent's task list.
+
 ## Chat
 
-`hyperrouter chat` is a full REPL on the free pool: streaming, sessions, skills and
-agent backends.
+`hyperrouter chat` opens the same TUI on the free pool. `--plain` gives the
+line-based REPL (what you get without a TTY). Both keep sessions, skills and agent
+backends.
 
 ```
 /help /model /models /task /strategy /temp /max /stream /enrich
