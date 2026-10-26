@@ -6,3 +6,7 @@ __pycache__/
 .env
 providers.env
 .DS_Store
+
+# local project pins and runtime files
+.hyperrouter/
+__pycache__/

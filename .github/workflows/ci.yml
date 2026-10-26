@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Parse the CLI
+        run: python -c "import ast; ast.parse(open('hyperrouter', encoding='utf-8').read())"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: CLI answers --version
+        run: |
+          install -m 755 hyperrouter /tmp/hyperrouter
+          /tmp/hyperrouter --version

@@ -1,0 +1,115 @@
+#compdef hyperrouter hyperRouter agent-router
+# zsh completion for hyperRouter
+# install: cp contrib/_hyperrouter /usr/share/zsh/site-functions/_hyperrouter
+#      or: cp contrib/_hyperrouter ~/.zsh/completions/_hyperrouter
+
+_hyperrouter() {
+  local -a commands
+  commands=(
+    'init:create config, database, protocol, and catalog'
+    'catalog:list or refresh the free-model catalog'
+    'sources:show which free sources the catalog came from'
+    'providers:list providers and configured account counts'
+    'models:rank free models for a task'
+    'pick:pick the single best free model for a task'
+    'prompt:build an enriched prompt'
+    'enrich:alias for prompt'
+    'route:run one request through the best free model'
+    'web:check, search and fetch from the web'
+    'update:pull a newer hyperRouter and reinstall the script'
+    'completions:print shell completion for bash, zsh or fish'
+    'man:print a roff man page for this CLI'
+    'skills:list, inspect and install Agent Skills (SKILL.md)'
+    'mcp:manage and call MCP servers'
+    'chat:interactive chat on the free pool'
+    'delegate:split a task and route each step to its best free model'
+    'agents:list agent backends usable inside hyperRouter'
+    'tui:full-screen chat and agent TUI'
+    'agent:coding agent: read, edit, search and run commands'
+    'serve:run the OpenAI-compatible proxy'
+    'service:start/stop/status the proxy'
+    'accounts:manage provider account references (never raw keys)'
+    'quota:show per-account usage and remaining quota'
+    'usage:show requests, tokens, latency and quota'
+    'stats:alias for usage'
+    'keys:generate and manage the local router API key'
+    'setup:wire the router into OpenCode, Freebuff, and DSH'
+    'run:launch an agent with router environment variables'
+    'doctor:check catalog, accounts, service, and integrations'
+    'settings:show or change hyperRouter settings'
+    'config:alias for settings'
+  )
+
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[show help and exit]' \
+    '--version[show the version and exit]' \
+    '1:command:->command' \
+    '*::arg:->args'
+
+  case $state in
+    command)
+      _describe -t commands 'hyperrouter command' commands
+      ;;
+    args)
+      case $words[2] in
+        agent)
+          _files
+          ;;
+        run)
+          if (( CURRENT == 3 )); then
+            _values 'agent target' opencode freebuff dsh
+          else
+            _files
+          fi
+          ;;
+        skills)
+          if (( CURRENT == 3 )); then
+            _values 'skills action' list show install install-defaults defaults sync update trust dedupe pin unpin remove path
+          else
+            _files
+          fi
+          ;;
+        completions)
+          _values 'shell' bash zsh fish
+          ;;
+        web)
+          if (( CURRENT == 3 )); then
+            _values 'web action' status search fetch
+          elif [[ $words[3] == fetch ]]; then
+            _urls
+          fi
+          ;;
+        mcp)
+          if (( CURRENT == 3 )); then
+            _values 'mcp action' list add add-rea defaults restart update remove enable disable test tools call
+          elif (( CURRENT == 4 )) && [[ $words[3] == add ]]; then
+            _values 'preset' rea ddg playwright brave tavily exa firecrawl
+          fi
+          ;;
+        settings|config)
+          if (( CURRENT == 3 )); then
+            _values 'settings action' show get set unset reset edit path keys
+          fi
+          ;;
+        service)
+          _values 'service action' start stop status restart
+          ;;
+        keys)
+          if (( CURRENT == 3 )); then
+            _values 'keys action' status list generate rotate show env revoke
+          fi
+          ;;
+        accounts)
+          if (( CURRENT == 3 )); then
+            _values 'accounts action' list add remove enable disable test
+          fi
+          ;;
+        prompt|enrich|route|delegate)
+          _files
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_hyperrouter "$@"

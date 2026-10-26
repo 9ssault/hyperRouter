@@ -20,14 +20,27 @@ spending money.
 
 ```bash
 git clone https://github.com/9ssault/hyperRouter.git
-install -m 755 hyperRouter/hyperrouter ~/.local/bin/hyperrouter
-ln -sf hyperrouter ~/.local/bin/hyperRouter
-hyperrouter init
+cd hyperRouter && ./install.sh        # ~/.local/bin, symlinks, then init
+```
+
+`install.sh` is POSIX sh, never uses sudo, is safe to re-run, and supports
+`--dry-run`, `--no-init`, `HYPERROUTER_PREFIX` and `HYPERROUTER_SRC`. Manual install
+still works:
+
+```bash
+install -m 755 hyperrouter ~/.local/bin/hyperrouter && ln -sf hyperrouter ~/.local/bin/hyperRouter
 ```
 
 You need Python 3.11+ (standard library only). Provider keys and local model
 servers are optional — keyless providers such as Pollinations and LLM7 work out of
-the box.
+the box. Windows works with `pip install windows-curses` for the TUI.
+
+```bash
+hyperrouter update --check   # is the checkout behind origin/main?
+hyperrouter update           # pull, then reinstall the script on PATH
+hyperrouter completions bash # also zsh and fish (files in contrib/)
+hyperrouter man > hyperrouter.1
+```
 
 ## Quick start
 
@@ -119,6 +132,20 @@ later change, arrows and PgUp/PgDn scroll long diffs. The CLI agent prints the s
 diff before its `[y/N/a]` prompt, and every decision is written to the transcript as
 `[edit] path — applied/denied`.
 
+### Quota-aware scheduling
+
+Free tiers are the bottleneck, so concurrency is capped deliberately.
+
+- `routing.max_concurrency` (default 3) gates concurrent upstream calls across the
+  main loop and every worker, so a four-worker fan-out cannot stampede one key.
+- A provider that answers 402/429/5xx goes on a cooldown taken from its
+  `Retry after` header (or 90 s for quota, 45 s for upstream errors), and routing
+  skips it until the cooldown expires instead of retrying it blindly.
+- Workers start staggered, retry once on a rate-limit/timeout, and each LLM call
+  waits for a slot rather than failing immediately.
+
+`hyperrouter quota` and `hyperrouter usage --by provider` still report what is left.
+
 ### Parallel workers
 
 The agent can call `subagent` with a list of `{files, task}` entries. Workers run
@@ -140,6 +167,12 @@ when the free pool rate-limits or times out, and return a merged answer:
 }
 ```
 
+Each worker runs in its **own scratch directory** with a copy of the files it owns,
+so an `rm`, a formatter or a `git checkout` in one worker cannot touch another's
+work. Finished files are copied back only if the original is byte-identical to the
+copy the worker started from; otherwise the file is reported under `conflicts` and
+left untouched. `agent.subagent_isolation false` disables the scratch copies.
+
 `shared` flags a file two workers both touched anyway. Workers cannot spawn workers,
 approval prompts are serialised so one diff viewer is open at a time, and `/workers`
 lists each worker's state and files in a framed overlay. `--no-subagents` (or
@@ -153,14 +186,45 @@ hyperrouter agent "why is this test flaky?" --json
 
 The interface itself: a header with the live model and backend, a scrolling
 transcript with role markers (`◆ you`, `◆ provider/model · latency`), a rules-and-
-placeholder input line, a segmented status bar (state, tools, workers, messages,
-context, tasks), and framed overlays for the model picker, usage, settings and
-approvals. `Ctrl+L` redraws after a resize.
+placeholder input line, a segmented status bar (state, tools, workers, web, plan
+mode, messages, context, tasks), and framed overlays for the model picker, usage,
+settings and approvals. `Ctrl+L` redraws after a resize, and frames are measured in
+display columns, so emoji and CJK text no longer break borders.
+
+Around the agent:
+
+- `/image screenshot.png` queues a png/jpg/webp/gif as a data URL on the next
+  message (8 MB cap) for vision-capable free models.
+- `@` starts file completion anywhere in the input; `Tab` accepts the first match.
+- `/undo-edit` restores the file from the most recent edit backup.
+- `/plan` is read-only mode; `/workers` shows worker state; `/tools` disables the loop.
 
 Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+O` usage, `Ctrl+U` clear line,
 `Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help,
 `PgUp/PgDn` scroll. `/tools` turns the tools off for a plain chat, `/todos` shows
 the agent's task list.
+
+### Safety and verification
+
+- **Plan mode**: `/plan` makes the session read-only. Writes, commands and non-reading
+  MCP tools are refused with a transcript note, and the system prompt asks for a plan
+  instead of an edit. `/plan` again returns to normal.
+- **Sandboxed commands**: when `bwrap` is installed, `run_command` runs with a read-only
+  root, a writable workspace, writable tool caches (`~/.cache`, `~/.npm`, `~/.cargo`,
+  `~/.local/share`) and an isolated PID namespace. Set `agent.sandbox none` to opt out,
+  or `agent.sandbox_network false` to cut network access inside the sandbox.
+- **Per-tool approvals**: `agent.approvals.write`, `.edit`, `.run` and `.mcp_write` can
+  each be turned off for unattended work; `--auto` still overrides everything.
+- **Web guard**: `web_fetch` accepts only http(s), resolves the hostname, refuses
+  loopback/private/link-local/reserved addresses, and re-checks every redirect hop.
+  Redirect chains cannot smuggle a request into `127.0.0.1` or a metadata service.
+- **Verification**: after the agent changes files, it detects the project's checks
+  (`pyproject.toml`/`pytest.ini` -> `python3 -m pytest -q`, `package.json` with a test
+  script -> `npm test`, `Cargo.toml`, `go.mod`, or a `Makefile` test target) and runs
+  them in the sandbox. The result is printed, shown in the TUI, and returned as
+  `verification` in `--json`. Pin it with
+  `hyperrouter settings set agent.verify_command "make check"`, or disable the step
+  with `agent.verify false`.
 
 ## Chat
 
@@ -199,10 +263,45 @@ stability and context fit.
 
 ```bash
 hyperrouter setup all --start     # clients, skills and web servers, then start the proxy
-hyperrouter agents                # what each backend can do
-hyperrouter run opencode          # launch a client with router env
+hyperrouter agents                # every harness, installed + verified flags
+hyperrouter run claude            # Claude Code against the Anthropic shim
+hyperrouter run codex             # Codex against the OpenAI-compatible proxy
+hyperrouter run aider             # Aider with OPENAI_BASE_URL pointed at us
+hyperrouter run opencode
 hyperrouter run dsh
 ```
+
+Supported harnesses: OpenCode, DeepSeek Harness, Claude Code, Codex, Aider, Cline,
+Pi, Hermes, Grok Build, Muse Code, Antigravity, and Freebuff (in-process). The last
+seven are launched with `-p`/`--message` conventions and marked *(flags unverified)*
+in `hyperrouter agents` until their CLI's non-interactive syntax is confirmed. Every
+harness gets the router environment (`HYPERROUTER_*`, plus `ANTHROPIC_BASE_URL` or
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` as appropriate) and one-shot use goes through the
+same free pool.
+
+### Claude Code without a Claude account
+
+`hyperrouter setup claude` writes `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`
+into `~/.claude/settings.json`, and the proxy serves the **Anthropic Messages API**:
+
+- `POST /v1/messages` (streaming and non-streaming)
+- `POST /v1/messages/count_tokens`
+- system blocks, text blocks, base64/URL images, `tool_use` and `tool_result`
+  translation in both directions, with Anthropic SSE events
+  (`message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop`)
+- Claude model ids are mapped onto the free pool unless they are real catalogue ids
+
+```bash
+hyperrouter setup claude
+claude -p "explain this repo"      # runs on the free pool, no Anthropic key
+```
+
+Streaming is translated from a completed free-model response, so tokens arrive in
+one batch rather than incrementally. Tool calls stream as a single `input_json_delta`.
+This compatibility layer follows the approach of
+[free-claude-code](https://github.com/alishahryar1/free-claude-code) (AGPL-3.0); no
+code from that project is copied here — the translation, routing and harness code is
+original and MIT.
 
 Inside `chat`, `/agent opencode` or `/agent dsh` sends each message to that agent's
 headless mode (`opencode run`, `dsh headless`) and prints the result in this CLI —
@@ -249,6 +348,21 @@ Skills are discovered in `~/.config/hyperrouter/skills`, `~/.agents/skills`,
 for the session; `/skills` lists them. Only the requested skill body is injected,
 size-capped, so a large library costs nothing until it is used.
 
+Lifecycle commands:
+
+```bash
+hyperrouter skills update      # git pull every installed collection
+hyperrouter skills trust       # provenance, commit, and how many scripts it ships
+hyperrouter skills dedupe      # duplicate names across roots and which one wins
+hyperrouter skills pin pdf     # pin a skill for this project (.hyperrouter/skills.json)
+hyperrouter skills unpin pdf
+```
+
+`skills trust` is the honest one: a skill is instructions and may ship runnable
+scripts. Collections with scripts are counted and flagged, each install records its
+repo and commit in `.provenance.json`, and nothing runs automatically. Treat a cloned
+collection the way you would treat a cloned repo.
+
 ## MCP
 
 ```bash
@@ -262,8 +376,13 @@ hyperrouter mcp add local --command uvx --args "some-mcp-server"
 The client speaks MCP over stdio (JSON-RPC: `initialize`, `tools/list`,
 `tools/call`) and works with any stdio server. Every enabled server's tools are
 injected into the agent loop as `mcp__<server>__<tool>`, so the model can search and
-crawl on its own. Servers stay running for the duration of a turn, which is what lets
-a browser navigate and then snapshot the same page.
+crawl on its own. In the TUI, servers stay alive between messages (idle sessions are
+recycled after 15 minutes and closed when you quit), which is what lets a browser
+navigate in one message and snapshot the same page in the next. `mcp restart` drops
+the sessions, `mcp update` also refreshes the tool schemas.
+
+MCP tools are annotated read-only or not. Read-only tools run freely; anything else
+asks the same approval viewer as writes (`agent.approvals.mcp_write`).
 
 Enabled by default, no key needed:
 
@@ -281,6 +400,16 @@ Registered but off until you export the named key: `brave` (`BRAVE_API_KEY`),
 (`FIRECRAWL_API_KEY`). `hyperrouter mcp defaults` turns any of them on automatically
 when its key is present. The agent also has keyless `web_search` and `web_fetch`
 built in, so it can look things up even with no MCP server running.
+
+Search prefers a keyed backend (Brave, then Tavily, then Exa) and falls back to Bing
+HTML. Results are cached for 15 minutes in `~/.local/share/hyperrouter/web-cache.json`,
+Bing scrapes are spaced out, and the cache is pruned by age. Inspect it with:
+
+```bash
+hyperrouter web status
+hyperrouter web search "python 3.14 release notes" --max-results 5
+hyperrouter web fetch https://docs.python.org/3/whatsnew/3.14.html --max-chars 4000
+```
 
 Playwright needs its Chromium once:
 
@@ -320,8 +449,31 @@ hyperrouter usage --by day --json
 ```
 
 Every request is recorded in SQLite with provider, model, account, status, token
-counts and latency. `hyperrouter quota` shows per-account limits; `doctor` checks
-the catalogue, database, service, auth and client wiring.
+counts and latency. `hyperrouter quota` shows per-account limits; `doctor` checks the
+catalogue, database, service, auth, client wiring, catalogue age, active web
+backends, sandbox availability, Python version and whether curses is importable.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -t . -v   # 40 tests, offline, stdlib only
+python3 -m compileall -q hyperrouter            # syntax gate
+./install.sh --dry-run                          # what the installer would do
+bash -n contrib/hyperrouter.bash                # completion syntax
+```
+
+The suite covers the diff/approval path, tool sandboxing and path escape, SSRF
+refusals, subagent overlap and isolation/conflict merging, verification success and
+failure, skill pinning, verify-command detection and display-width handling. CI runs
+the same suite on Python 3.11 and 3.13 (`.github/workflows/ci.yml`). Tests redirect
+HOME and XDG to a temp directory and set `HYPERROUTER_NO_MCP=1`, so they never touch
+your config or spawn a server.
+
+`pyproject.toml` is PEP 621 metadata for editors and scanners; it deliberately
+declares no console script because setuptools cannot ship the extension-less
+`hyperrouter` file as a module. `install.sh` is the supported install path.
+
+## Licence
 
 ## The proxy
 
@@ -332,7 +484,8 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Any OpenAI-compatible client can point at `/v1`. Model aliases: `auto`,
+Any OpenAI-compatible client can point at `/v1`; Claude Code can point at
+`/v1/messages` instead (see above). Model aliases: `auto`,
 `auto-coding`, `auto-reasoning`, `auto-long`, `auto-vision`, `auto-fast`,
 `auto-quality`, `auto-cheap`, `auto-agentic`.
 

@@ -1,0 +1,44 @@
+# PEP 621 metadata for hyperRouter.
+#
+# The CLI ships as one dependency-free script (`./hyperrouter`) so that it can be
+# copied onto a machine and run immediately. This file exists for tooling
+# (editors, dependency scanners, `pipx` metadata) and declares the command name;
+# a wheel built from it is a stub, not the supported install path.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyperrouter"
+version = "2.4.0"
+description = "Free-model router and terminal coding agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "9ssault" }]
+keywords = ["llm", "router", "agent", "mcp", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: User Interfaces",
+]
+dependencies = []
+
+[project.optional-dependencies]
+windows = ["windows-curses"]
+
+# No console-script entry point: the program is the extension-less `hyperrouter`
+# script, which setuptools cannot ship as a module. Install it with ./install.sh
+# (or copy it onto PATH). A wheel from this file is metadata only.
+
+[project.urls]
+Homepage = "https://github.com/9ssault/hyperRouter"
+
+[tool.setuptools]
+# No importable module ships in this repository; the script is the program.
+py-modules = []

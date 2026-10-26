@@ -29,6 +29,7 @@ import threading
 import difflib
 import hashlib
 import hmac
+import ipaddress
 import itertools
 import json
 import math
@@ -41,8 +42,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,7 +57,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -76,6 +79,36 @@ OPENCODE_CONFIG = Path(os.environ.get("OPENCODE_CONFIG") or OPENCODE_CONFIG_HOME
 FREEBUFF_BYOK = Path(os.environ.get("FREEBUFF_BYOK_CONFIG_DIR") or HOME / ".config" / "freebuff" / "byok") / "connections.json"
 DSH_HOME = Path(os.environ.get("DSH_HOME") or HOME / ".dsh")
 DSH_PATCH = DSH_HOME / "cordis.patch.yml"
+CLAUDE_SETTINGS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude") / "settings.json"
+
+
+def setup_claude(dry_run: bool = False) -> list[str]:
+    """Point Claude Code at the Anthropic-compatible /v1/messages shim."""
+    config = load_config()
+    host = str(config.get("server", {}).get("host") or "127.0.0.1")
+    port = int(config.get("server", {}).get("port") or 8787)
+    data: dict[str, Any] = {}
+    if CLAUDE_SETTINGS.is_file():
+        try:
+            loaded = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    env_block = data.get("env") if isinstance(data.get("env"), dict) else {}
+    env_block["ANTHROPIC_BASE_URL"] = f"http://{host}:{port}"
+    env_block["ANTHROPIC_AUTH_TOKEN"] = load_api_key() or "local"
+    env_block.setdefault("ANTHROPIC_API_KEY", env_block["ANTHROPIC_AUTH_TOKEN"])
+    data["env"] = env_block
+    if dry_run:
+        return [f"claude: would point {CLAUDE_SETTINGS} at http://{host}:{port}"]
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    backup(CLAUDE_SETTINGS)
+    CLAUDE_SETTINGS.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(CLAUDE_SETTINGS, 0o600)
+    except OSError:
+        pass
+    return [f"claude: pointed {CLAUDE_SETTINGS} at http://{host}:{port} (Anthropic Messages)"]
 AGENTS_GLOBAL_MD = Path(os.environ.get("DSH_AGENTS_HOME") or HOME / ".agents") / "AGENTS.md"
 LAMA_PROMPTS = Path(os.environ.get("LAMA_PROMPT_DIR") or HOME / ".config" / "lama" / "prompts")
 
@@ -155,6 +188,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8787},
     "routing": {
         "strategy": "balanced",
+        "max_concurrency": 3,
         "max_fallbacks": 6,
         "candidate_timeout_seconds": 45,
         "total_timeout_seconds": 120,
@@ -191,7 +225,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "agent": True},
     "agent": {"enabled": True, "auto_approve": False, "max_rounds": 10,
               "allow_outside": False, "tool_result_chars": 12000,
-              "subagents": True, "max_subagents": 4, "subagent_rounds": 4},
+              "sandbox": "auto", "sandbox_network": True,
+              "approvals": {"write": True, "edit": True, "run": True, "mcp_write": True},
+              "verify": True, "verify_command": "", "verify_timeout": 300,
+              "subagents": True, "max_subagents": 4, "subagent_rounds": 4,
+              "subagent_isolation": True},
     "skills": {"auto_load": [], "catalog_in_prompt": False},
 }
 
@@ -312,6 +350,9 @@ def write_text(path: Path, text: str, mode: int = 0o600) -> None:
         pass
 
 
+LAST_BACKUPS: list[tuple[Path, Path]] = []
+
+
 def backup(path: Path) -> Path | None:
     if not path.exists():
         return None
@@ -322,7 +363,38 @@ def backup(path: Path) -> Path | None:
         os.chmod(dest, 0o600)
     except OSError:
         pass
+    LAST_BACKUPS.append((path, dest))
+    del LAST_BACKUPS[:-50]
     return dest
+
+
+def restore_last_backup() -> str:
+    while LAST_BACKUPS:
+        original, saved = LAST_BACKUPS.pop()
+        if saved.is_file():
+            shutil.copy2(saved, original)
+            saved.unlink(missing_ok=True)
+            return str(original)
+    return ""
+
+
+IMAGE_SUFFIXES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                  ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def load_image_attachment(raw: str, max_bytes: int = 8_000_000) -> dict[str, Any]:
+    path = Path(os.path.expanduser(raw)).resolve()
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
+    mime = IMAGE_SUFFIXES.get(path.suffix.lower())
+    if not mime:
+        raise ValueError("supported images: png, jpg, jpeg, webp, gif")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"image is {size // 1_000_000} MB; the limit is "
+                         f"{max_bytes // 1_000_000} MB")
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"name": path.name, "url": f"data:{mime};base64,{data}"}
 
 
 def strip_jsonc(text: str) -> str:
@@ -2051,6 +2123,44 @@ def prepare_route(
     return body, requested, task, candidates
 
 
+PROVIDER_COOLDOWN: dict[str, float] = {}
+COOLDOWN_LOCK = threading.Lock()
+REQUEST_GATE: dict[str, Any] = {"lock": threading.Lock(), "sem": None, "size": 0}
+
+
+def provider_cooling(provider: str) -> float:
+    """Seconds left before this provider should be tried again (0 = ready)."""
+    with COOLDOWN_LOCK:
+        until = PROVIDER_COOLDOWN.get(provider, 0.0)
+    return max(0.0, until - time.monotonic())
+
+
+def cool_provider(provider: str, seconds: float) -> None:
+    if not provider or seconds <= 0:
+        return
+    with COOLDOWN_LOCK:
+        PROVIDER_COOLDOWN[provider] = max(PROVIDER_COOLDOWN.get(provider, 0.0),
+                                          time.monotonic() + seconds)
+
+
+def note_provider_failure(provider: str, status: int, error: str) -> None:
+    wait = retry_after_seconds(error)
+    if not wait:
+        wait = 90 if status in {402, 429} else 45 if status >= 500 else 0
+    cool_provider(provider, wait)
+
+
+def request_gate() -> threading.Semaphore:
+    """Limit concurrent upstream calls so parallel workers do not stampede."""
+    config = load_config()
+    size = max(1, min(int((config.get("routing") or {}).get("max_concurrency") or 3), 16))
+    with REQUEST_GATE["lock"]:
+        if REQUEST_GATE["sem"] is None or REQUEST_GATE["size"] != size:
+            REQUEST_GATE["sem"] = threading.BoundedSemaphore(size)
+            REQUEST_GATE["size"] = size
+        return REQUEST_GATE["sem"]
+
+
 def route_once(
     messages: list[dict[str, Any]],
     model: str = "auto",
@@ -2072,6 +2182,9 @@ def route_once(
         account = candidate.get("account") or {}
         if account.get("id") in failed_accounts:
             continue
+        provider_name = str(candidate["model"].get("provider") or "")
+        if provider_cooling(provider_name) > 0:
+            continue
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             errors.append({"provider": candidate["model"].get("provider"),
@@ -2083,6 +2196,8 @@ def route_once(
         if ok:
             return result
         errors.append(result)
+        note_provider_failure(provider_name, int(result.get("status") or 0),
+                              str(result.get("error") or ""))
         if account_wide_error(int(result.get("status") or 0)):
             failed_accounts.add(str(account.get("id")))
     raise RuntimeError("all free candidates failed: " + "; ".join(
@@ -2238,6 +2353,144 @@ def stream_route(
         for e in errors))
 
 
+def _anthropic_blocks_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [str(block.get("text") or "") for block in content
+                 if isinstance(block, dict) and block.get("type") == "text"]
+        return "\n".join(parts)
+    return ""
+
+
+def _anthropic_tool_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif isinstance(block, dict) and block.get("type") == "image":
+                parts.append("[image]")
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def anthropic_to_openai(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
+                                                       list[dict[str, Any]]]:
+    """Convert an Anthropic Messages request into OpenAI chat messages + tools."""
+    messages: list[dict[str, Any]] = []
+    system = body.get("system")
+    system_text = _anthropic_blocks_text(system)
+    if system_text.strip():
+        messages.append({"role": "system", "content": system_text})
+    for raw in body.get("messages") or []:
+        if not isinstance(raw, dict):
+            continue
+        role = str(raw.get("role") or "user")
+        content = raw.get("content")
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        texts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[tuple[str, str]] = []
+        images: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                texts.append(str(block.get("text") or ""))
+            elif kind == "image":
+                source = block.get("source") or {}
+                if isinstance(source, dict):
+                    if source.get("type") == "base64":
+                        media = str(source.get("media_type") or "image/png")
+                        data = str(source.get("data") or "")
+                        images.append({"type": "image_url",
+                                       "image_url": {"url": f"data:{media};base64,{data}"}})
+                    elif source.get("type") == "url" and source.get("url"):
+                        images.append({"type": "image_url",
+                                       "image_url": {"url": str(source["url"])}})
+            elif kind == "tool_use":
+                tool_calls.append({
+                    "id": str(block.get("id") or f"call_{len(tool_calls)}"),
+                    "type": "function",
+                    "function": {"name": str(block.get("name") or ""),
+                                 "arguments": json.dumps(block.get("input") or {})},
+                })
+            elif kind == "tool_result":
+                tool_results.append((str(block.get("tool_use_id") or ""),
+                                     _anthropic_tool_result_text(block.get("content"))))
+        text = "\n".join(part for part in texts if part)
+        if role == "assistant":
+            message: dict[str, Any] = {"role": "assistant", "content": text}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+            continue
+        if text or images:
+            if images:
+                parts = ([{"type": "text", "text": text}] if text else []) + images
+                messages.append({"role": role, "content": parts})
+            else:
+                messages.append({"role": role, "content": text})
+        for tool_id, output in tool_results:
+            messages.append({"role": "tool", "tool_call_id": tool_id,
+                             "content": output or "(empty)"})
+    tools: list[dict[str, Any]] = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        tools.append({"type": "function", "function": {
+            "name": str(tool.get("name") or ""),
+            "description": str(tool.get("description") or "")[:1000],
+            "parameters": schema,
+        }})
+    return messages, tools
+
+
+def openai_response_to_anthropic(result: dict[str, Any], model: str) -> dict[str, Any]:
+    """Convert an OpenAI chat completion into an Anthropic Messages response."""
+    message = response_message(result)
+    content: list[dict[str, Any]] = []
+    text = content_to_text(message.get("content"))
+    if text:
+        content.append({"type": "text", "text": text})
+    calls = message.get("tool_calls") or []
+    for index, call in enumerate(calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        raw = function.get("arguments")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+        except json.JSONDecodeError:
+            parsed = {"input": raw}
+        content.append({"type": "tool_use", "id": str(call.get("id") or f"toolu_{index}"),
+                        "name": str(function.get("name") or ""),
+                        "input": parsed if isinstance(parsed, dict) else {}})
+    usage = result.get("usage") or {}
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": "tool_use" if calls else "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": int(usage.get("prompt_tokens") or 0),
+                  "output_tokens": int(usage.get("completion_tokens") or 0)},
+    }
+
+
 class RouterHandler:
     """Mixin-style handler methods; the real class is created below."""
 
@@ -2332,7 +2585,8 @@ class RouterHandler:
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path not in {"/v1/chat/completions", "/v1/completions"}:
+        if path not in {"/v1/chat/completions", "/v1/completions", "/v1/messages",
+                        "/v1/messages/count_tokens"}:
             self.send_json(404, {"error": {"message": "not found", "type": "not_found"}})
             return
         if not self.require_auth():
@@ -2341,6 +2595,26 @@ class RouterHandler:
             body = self.read_body()
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": {"message": f"invalid JSON: {exc}", "type": "invalid_request_error"}})
+            return
+        if path == "/v1/messages/count_tokens":
+            try:
+                messages, tools = anthropic_to_openai(body)
+            except (ValueError, TypeError) as exc:
+                self.send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                return
+            tokens = estimate_tokens(messages_to_text(messages))
+            if tools:
+                tokens += estimate_tokens(json.dumps(tools))
+            self.send_json(200, {"input_tokens": max(1, tokens)})
+            return
+        if path == "/v1/messages":
+            try:
+                self.handle_anthropic(body)
+            except BrokenPipeError:
+                return
+            except Exception as exc:  # noqa: BLE001 - keep the proxy alive
+                self.send_json(500, {"type": "error", "error": {
+                    "type": "api_error", "message": redact(str(exc))}})
             return
         if path == "/v1/completions":
             prompt = body.get("prompt")
@@ -2353,6 +2627,80 @@ class RouterHandler:
             return
         except Exception as exc:  # noqa: BLE001 - the proxy must not crash the server
             self.send_json(500, {"error": {"message": redact(str(exc)), "type": "router_error"}})
+
+    def anthropic_model(self, requested: str) -> str:
+        """Claude clients send Claude model ids; map anything unknown to the free pool."""
+        if requested in ALIAS_DESCRIPTIONS:
+            return requested
+        catalog = load_catalog()
+        ids = {str(model.get("id")) for model in catalog.get("models") or []}
+        return requested if requested in ids else "auto"
+
+    def sse(self, event: str, payload: dict[str, Any]) -> None:
+        raw = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        self.wfile.write(raw.encode("utf-8"))
+        self.wfile.flush()
+
+    def handle_anthropic(self, body: dict[str, Any]) -> None:
+        messages, tools = anthropic_to_openai(body)
+        if not messages:
+            self.send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "messages must not be empty"}})
+            return
+        requested = self.anthropic_model(str(body.get("model") or "auto"))
+        max_tokens = int(body.get("max_tokens") or 0) or None
+        temperature = body.get("temperature")
+        try:
+            result = route_once(messages, model=requested, max_tokens=max_tokens,
+                                temperature=float(temperature) if temperature is not None else None,
+                                tools=tools or None)
+        except RuntimeError as exc:
+            self.send_json(503, {"type": "error", "error": {
+                "type": "overloaded_error", "message": redact(str(exc))}})
+            return
+        payload = openai_response_to_anthropic(result, requested)
+        if not payload["content"]:
+            payload["content"] = [{"type": "text", "text": "(the free model returned nothing)"}]
+        if not body.get("stream"):
+            self.send_json(200, payload)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.sse("message_start", {"type": "message_start", "message": {
+            "id": payload["id"], "type": "message", "role": "assistant",
+            "model": payload["model"], "content": [], "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": payload["usage"]["input_tokens"],
+                      "output_tokens": 0}}})
+        for index, block in enumerate(payload["content"]):
+            if block.get("type") == "text":
+                self.sse("content_block_start", {"type": "content_block_start", "index": index,
+                                                 "content_block": {"type": "text", "text": ""}})
+                text = str(block.get("text") or "")
+                for start in range(0, len(text), 200):
+                    self.sse("content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": text[start:start + 200]}})
+                self.sse("content_block_stop", {"type": "content_block_stop", "index": index})
+            elif block.get("type") == "tool_use":
+                self.sse("content_block_start", {"type": "content_block_start", "index": index,
+                                                 "content_block": {"type": "tool_use",
+                                                                   "id": block.get("id"),
+                                                                   "name": block.get("name"),
+                                                                   "input": {}}})
+                self.sse("content_block_delta", {
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(block.get("input") or {})}})
+                self.sse("content_block_stop", {"type": "content_block_stop", "index": index})
+        self.sse("message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": payload["stop_reason"],
+                                              "stop_sequence": None},
+                                    "usage": {"output_tokens": payload["usage"]["output_tokens"]}})
+        self.sse("message_stop", {"type": "message_stop"})
 
     def handle_chat(self, body: dict[str, Any]) -> None:
         requested = str(body.get("model") or "auto")
@@ -3320,7 +3668,8 @@ def cmd_keys(args: argparse.Namespace) -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     ensure_dirs()
-    targets = ["opencode", "freebuff", "dsh"] if args.target == "all" else [args.target]
+    targets = (["opencode", "freebuff", "dsh", "claude"] if args.target == "all"
+               else [args.target])
     actions: list[str] = []
     try:
         if not args.no_key:
@@ -3346,6 +3695,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 actions.extend(setup_freebuff(dry_run=args.dry_run))
             elif target == "dsh":
                 actions.extend(setup_dsh(dry_run=args.dry_run))
+            elif target == "claude":
+                actions.extend(setup_claude(dry_run=args.dry_run))
         protocol = PROTOCOL_PATH
         existing_protocol = read_text(protocol)
         if existing_protocol.strip() != PROTOCOL_FALLBACK.strip():
@@ -3417,6 +3768,7 @@ SETTINGS_DOCS: dict[str, str] = {
     "server.host": "Bind address for the local proxy",
     "server.port": "Port for the local proxy",
     "routing.strategy": "balanced | quality | speed | cheap | round-robin | least-used",
+    "routing.max_concurrency": "Concurrent upstream requests allowed across workers",
     "routing.max_fallbacks": "How many free models to try before giving up",
     "routing.candidate_timeout_seconds": "Per-model request timeout",
     "routing.total_timeout_seconds": "Wall-clock budget for one route",
@@ -3447,6 +3799,15 @@ SETTINGS_DOCS: dict[str, str] = {
     "agent.allow_outside": "Allow file tools outside the working directory",
     "agent.tool_result_chars": "How much tool output is kept in context",
     "mcp.agent": "Give the agent the tools of every enabled MCP server",
+    "agent.sandbox": "auto: run commands in bubblewrap when it is installed",
+    "agent.sandbox_network": "Let sandboxed commands reach the network",
+    "agent.approvals.write": "Ask before write_file (false = always allow)",
+    "agent.approvals.edit": "Ask before edit_file",
+    "agent.approvals.run": "Ask before run_command",
+    "agent.approvals.mcp_write": "Ask before MCP tools that are not read-only",
+    "agent.verify": "Run the project's tests after the agent edits files",
+    "agent.verify_command": "Command used for verification (empty = auto-detect)",
+    "agent.subagent_isolation": "Run each worker in its own scratch copy, then merge",
     "agent.subagents": "Let the agent fan work out to parallel workers",
     "agent.max_subagents": "Parallel workers per subagent call",
     "agent.subagent_rounds": "Tool rounds allowed to each worker",
@@ -4024,7 +4385,85 @@ def install_skill_repo(target: str, name: str | None = None) -> tuple[bool, str]
     if result.returncode != 0:
         return False, result.stderr.decode("utf-8", "replace").strip()[:400]
     found = len(list(destination.rglob("SKILL.md")))
+    write_skill_provenance(destination, url)
     return True, f"installed {name} with {found} skill(s) into {destination}"
+
+
+def write_skill_provenance(destination: Path, repo: str) -> dict[str, Any]:
+    """Record where a collection came from, plus how much runnable code it ships."""
+    if not repo or repo.startswith("(unknown"):
+        repo = next((name for name, folder in DEFAULT_SKILL_COLLECTIONS.items()
+                     if folder == destination.name), repo)
+    commit = ""
+    try:
+        proc = subprocess.run(["git", "-C", str(destination), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=20, check=False)
+        commit = proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    scripts = 0
+    executables = 0
+    for file in destination.rglob("*"):
+        if not file.is_file():
+            continue
+        if file.suffix in {".sh", ".py", ".js", ".ts", ".ps1", ".rb"}:
+            scripts += 1
+            if os.access(file, os.X_OK):
+                executables += 1
+    data = {"repo": repo, "commit": commit, "installed_at": utc_now(),
+            "skills": len(list(destination.rglob("SKILL.md"))),
+            "scripts": scripts, "executables": executables}
+    try:
+        (destination / ".provenance.json").write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return data
+
+
+def collect_provenance() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for root in (SKILL_ROOT, HOME / ".agents" / "skills"):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            data: dict[str, Any] = {}
+            marker = entry / ".provenance.json"
+            if marker.is_file():
+                try:
+                    data = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    data = {}
+            data.setdefault("name", entry.name)
+            data.setdefault("path", str(entry))
+            data.setdefault("skills", len(list(entry.rglob("SKILL.md"))))
+            data.setdefault("repo", "(unknown - installed before provenance)")
+            rows.append(data)
+    return rows
+
+
+def project_skills_path() -> Path:
+    return Path.cwd() / ".hyperrouter" / "skills.json"
+
+
+def project_skills() -> list[str]:
+    path = project_skills_path()
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = data.get("skills") if isinstance(data, dict) else data
+    return [str(item) for item in (items or []) if str(item).strip()]
+
+
+def set_project_skills(names: Sequence[str]) -> None:
+    path = project_skills_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"skills": list(names)}, indent=2) + "\n", encoding="utf-8")
 
 
 def ensure_default_skills(verbose: bool = True) -> list[str]:
@@ -4054,6 +4493,66 @@ def cmd_skills(args: argparse.Namespace) -> int:
         print(SKILL_ROOT)
         for path in skill_search_dirs():
             print(path)
+        return 0
+    if action == "update":
+        updated = 0
+        for row in collect_provenance():
+            path = Path(str(row.get("path")))
+            if not (path / ".git").exists():
+                print(f"skip   {path.name} (not a git checkout)")
+                continue
+            proc = subprocess.run(["git", "-C", str(path), "pull", "--ff-only"],
+                                  capture_output=True, text=True, timeout=180, check=False)
+            status = "updated" if proc.returncode == 0 else "failed"
+            if proc.returncode == 0:
+                updated += 1
+                write_skill_provenance(path, "")
+            detail = (proc.stdout or proc.stderr).strip().splitlines()
+            print(f"{status:<7} {path.name}" + (f" - {detail[-1][:100]}" if detail else ""))
+        print(f"{updated} collection(s) updated, {len(discover_skills())} skill(s) available")
+        return 0
+    if action == "trust":
+        rows = collect_provenance()
+        print(f"{'collection':<34} {'skills':>6} {'scripts':>7}  origin")
+        risky = 0
+        for row in rows:
+            scripts = int(row.get("scripts") or 0)
+            risky += 1 if scripts else 0
+            origin = str(row.get("repo") or "")[:60]
+            print(f"{str(row.get('name'))[:34]:<34} {int(row.get('skills') or 0):>6} "
+                  f"{scripts:>7}  {origin}")
+        print(f"\n{len(rows)} collection(s); {risky} ship runnable scripts. Skills are "
+              "instructions, not sandboxed code - review before trusting a repo.")
+        return 0
+    if action in {"pin", "unpin"}:
+        if not args.target:
+            die(f"usage: hyperrouter skills {action} <name>")
+        names = project_skills()
+        if action == "pin":
+            if not find_skill(args.target):
+                die(f"unknown skill: {args.target}")
+            if args.target not in names:
+                names.append(args.target)
+        else:
+            names = [name for name in names if name != args.target]
+        set_project_skills(names)
+        print(f"{args.target} {'pinned to' if action == 'pin' else 'unpinned from'} "
+              f"{project_skills_path()}")
+        return 0
+    if action == "dedupe":
+        seen: dict[str, list[str]] = {}
+        for skill in discover_skills():
+            seen.setdefault(str(skill["name"]), []).append(str(skill["path"]))
+        duplicates = {name: paths for name, paths in seen.items() if len(paths) > 1}
+        if not duplicates:
+            print(f"no duplicate skill names across {len(seen)} skill(s)")
+            return 0
+        for name, paths in sorted(duplicates.items()):
+            print(f"{name}:")
+            for path in paths:
+                print(f"  {path}")
+        print(f"\n{len(duplicates)} duplicated name(s); the first path in the search "
+              "order wins. Remove a collection to change precedence.")
         return 0
     if action == "install":
         if not args.target:
@@ -4280,6 +4779,8 @@ def mcp_servers(config: dict[str, Any] | None = None) -> dict[str, dict[str, Any
 
 
 MCP_SESSIONS: dict[str, McpClient] = {}
+MCP_SESSION_USED: dict[str, float] = {}
+MCP_SESSION_IDLE = 900.0
 MCP_SESSION_LOCK = threading.RLock()
 
 
@@ -4295,12 +4796,14 @@ def mcp_call(server_name: str, tool: str, arguments: dict[str, Any],
     # A browser server keeps its page between calls, so reuse one process per turn.
     with MCP_SESSION_LOCK:
         client = MCP_SESSIONS.get(server_name)
-        if client is not None and client.proc.poll() is not None:
+        stale = time.monotonic() - MCP_SESSION_USED.get(server_name, 0.0) > MCP_SESSION_IDLE
+        if client is not None and (client.proc.poll() is not None or stale):
             client.close()
             client = None
         if client is None:
             client = McpClient(server, timeout=timeout)
             MCP_SESSIONS[server_name] = client
+        MCP_SESSION_USED[server_name] = time.monotonic()
         return client.call_tool(tool, arguments)
 
 
@@ -4312,6 +4815,12 @@ def close_mcp_sessions() -> None:
             except Exception:  # noqa: BLE001
                 pass
         MCP_SESSIONS.clear()
+        MCP_SESSION_USED.clear()
+
+
+def restart_mcp_sessions() -> None:
+    close_mcp_sessions()
+    MCP_AGENT_CACHE.update({"key": None, "ts": 0.0, "specs": [], "map": {}})
 
 
 MCP_AGENT_CACHE: dict[str, Any] = {"key": None, "ts": 0.0, "specs": [], "map": {}}
@@ -4351,7 +4860,7 @@ def mcp_agent_specs(config: dict[str, Any] | None = None,
             return name, [], str(exc)
 
     specs: list[dict[str, Any]] = []
-    mapping: dict[str, tuple[str, str]] = {}
+    mapping: dict[str, dict[str, Any]] = {}
     if servers:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(servers))) as pool:
             futures = [pool.submit(discover, name, server)
@@ -4368,7 +4877,11 @@ def mcp_agent_specs(config: dict[str, Any] | None = None,
                     if not tool_name:
                         continue
                     exposed = _mcp_tool_name(name, tool_name)
-                    mapping[exposed] = (name, tool_name)
+                    annotations = tool.get("annotations") or {}
+                    readonly = bool(annotations.get("readOnlyHint", False)) if isinstance(
+                        annotations, dict) else False
+                    mapping[exposed] = {"server": name, "tool": tool_name,
+                                       "readonly": readonly}
                     schema = tool.get("inputSchema")
                     if not isinstance(schema, dict):
                         schema = {"type": "object", "properties": {}}
@@ -4411,6 +4924,13 @@ def cmd_mcp(args: argparse.Namespace) -> int:
         for line in ensure_default_mcp():
             print(line)
         print(f"check them: {PROG} mcp list && {PROG} mcp tools ddg")
+        return 0
+    if action in {"restart", "update"}:
+        restart_mcp_sessions()
+        print("MCP sessions closed; tool schemas will be rediscovered on the next turn")
+        if action == "update":
+            print("npx packages are fetched with @latest on the next start, so this "
+                  "also picks up server updates")
         return 0
     if action == "add":
         if not args.name:
@@ -4538,6 +5058,9 @@ CHAT_COMMANDS = {
     "/mcp [server]": "list MCP servers or their tools",
     "/tools [on|off]": "turn the coding tools and MCP tools on or off",
     "/workers": "parallel workers: state and changed files",
+    "/image <path>": "attach an image to the next message",
+    "/plan": "read-only mode: propose, do not edit",
+    "/undo-edit": "restore the file from the last edit backup",
     "/init": "write an AGENTS.md for this directory",
     "/exit": "leave chat",
 }
@@ -5164,12 +5687,44 @@ def agent_system_prompt(cwd: Path, skills: Sequence[str] = ()) -> str:
     return "\n\n".join(parts)
 
 
-def _tool_path(raw: Any, allow_outside: bool = False) -> Path:
-    path = Path(os.path.expanduser(str(raw or "."))).resolve()
-    root = Path.cwd().resolve()
-    if not allow_outside and path != root and root not in path.parents:
+def _work_root(root: Any = None) -> Path:
+    return Path(root).resolve() if root else Path.cwd().resolve()
+
+
+def _tool_path(raw: Any, allow_outside: bool = False, root: Any = None) -> Path:
+    base = _work_root(root)
+    raw_path = Path(os.path.expanduser(str(raw or ".")))
+    path = (raw_path if raw_path.is_absolute() else base / raw_path).resolve()
+    if not allow_outside and path != base and base not in path.parents:
         raise ValueError(f"path is outside the working directory: {path}")
     return path
+
+
+def display_width(text: str) -> int:
+    width = 0
+    for char in str(text or ""):
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def clip_display(text: str, width: int) -> str:
+    """Trim a string to a display width without splitting wide characters."""
+    if width <= 0:
+        return ""
+    out: list[str] = []
+    used = 0
+    for char in str(text or ""):
+        if unicodedata.combining(char):
+            out.append(char)
+            continue
+        size = 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        if used + size > width:
+            break
+        out.append(char)
+        used += size
+    return "".join(out)
 
 
 def _cap(text: str, limit: int = 12000) -> str:
@@ -5202,8 +5757,8 @@ def preview_footer(preview: str) -> str:
     return first
 
 
-def tool_read_file(args: dict[str, Any]) -> str:
-    path = _tool_path(args.get("path"))
+def tool_read_file(args: dict[str, Any], root: Any = None) -> str:
+    path = _tool_path(args.get("path"), root=root)
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     start = max(1, int(args.get("start_line") or 1))
@@ -5214,8 +5769,8 @@ def tool_read_file(args: dict[str, Any]) -> str:
 
 
 def tool_write_file(args: dict[str, Any], allow_outside: bool = False,
-                    approve: Any = None) -> str:
-    path = _tool_path(args.get("path"), allow_outside)
+                    approve: Any = None, root: Any = None) -> str:
+    path = _tool_path(args.get("path"), allow_outside, root)
     content = str(args.get("content") or "")
     before = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     if path.is_dir():
@@ -5230,8 +5785,8 @@ def tool_write_file(args: dict[str, Any], allow_outside: bool = False,
 
 
 def tool_edit_file(args: dict[str, Any], allow_outside: bool = False,
-                   approve: Any = None) -> str:
-    path = _tool_path(args.get("path"), allow_outside)
+                   approve: Any = None, root: Any = None) -> str:
+    path = _tool_path(args.get("path"), allow_outside, root)
     old = str(args.get("old_string") or "")
     new = str(args.get("new_string") or "")
     if not old:
@@ -5252,8 +5807,8 @@ def tool_edit_file(args: dict[str, Any], allow_outside: bool = False,
     return f"edited {path} ({count} replacement{'s' if count != 1 else ''}, {len(updated)} chars)"
 
 
-def tool_list_dir(args: dict[str, Any]) -> str:
-    path = _tool_path(args.get("path"))
+def tool_list_dir(args: dict[str, Any], root: Any = None) -> str:
+    path = _tool_path(args.get("path"), root=root)
     if not path.is_dir():
         raise ValueError(f"not a directory: {path}")
     entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -5262,11 +5817,11 @@ def tool_list_dir(args: dict[str, Any]) -> str:
     return f"{path}\n" + "\n".join(rows) + more
 
 
-def tool_search(args: dict[str, Any]) -> str:
+def tool_search(args: dict[str, Any], root: Any = None) -> str:
     pattern = str(args.get("pattern") or "")
     if not pattern:
         raise ValueError("pattern is required")
-    path = _tool_path(args.get("path") or ".")
+    path = _tool_path(args.get("path") or ".", root=root)
     limit = max(1, min(int(args.get("max_results") or 50), 300))
     rg = shutil.which("rg")
     if rg:
@@ -5299,14 +5854,48 @@ WEB_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 
+def _assert_public_url(url: str) -> None:
+    """Reject non-HTTP schemes and any host that resolves to a private address."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"only http(s) URLs are allowed, not {parsed.scheme or 'none'}")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("url has no host")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal")):
+        raise ValueError("refusing to fetch a local address")
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, parsed.port or 80,
+                                                               proto=socket.IPPROTO_TCP)}
+    except socket.gaierror as exc:
+        raise ValueError(f"could not resolve {host}: {exc}") from exc
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address.split("%")[0])
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"refusing to fetch {host}: it resolves to the private address {ip}")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any,
+                         newurl: str) -> Any:
+        _assert_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _web_get(url: str, timeout: float = 25.0, max_bytes: int = 3_000_000) -> tuple[str, str]:
     """Fetch a URL with a browser user agent; return (final_url, body)."""
+    _assert_public_url(url)
     request = urllib.request.Request(url, headers={
         "User-Agent": WEB_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.8",
     })
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    with opener.open(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         body = response.read(max_bytes).decode(charset, errors="replace")
         return str(response.geturl() or url), body
@@ -5336,16 +5925,112 @@ def _strip_html(fragment: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def tool_web_search(args: dict[str, Any]) -> str:
-    query = str(args.get("query") or "").strip()
-    if not query:
-        raise ValueError("query is required")
-    limit = max(1, min(int(args.get("max_results") or 8), 20))
+WEB_CACHE_PATH = DATA_HOME / "web-cache.json"
+WEB_CACHE_TTL = 900
+WEB_RATE_LOCK = threading.Lock()
+WEB_LAST_CALL: dict[str, float] = {}
+
+
+def _web_rate_limit(host: str, interval: float = 1.5) -> None:
+    with WEB_RATE_LOCK:
+        last = WEB_LAST_CALL.get(host, 0.0)
+        wait = interval - (time.monotonic() - last)
+        if wait > 0:
+            time.sleep(wait)
+        WEB_LAST_CALL[host] = time.monotonic()
+
+
+def _web_cache_read() -> dict[str, Any]:
+    try:
+        data = json.loads(WEB_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _web_cache_get(key: str) -> Any:
+    entry = _web_cache_read().get(key)
+    if not isinstance(entry, dict):
+        return None
+    if time.time() - float(entry.get("ts") or 0) > WEB_CACHE_TTL:
+        return None
+    return entry.get("value")
+
+
+def _web_cache_set(key: str, value: Any) -> None:
+    data = _web_cache_read()
+    data[key] = {"ts": time.time(), "value": value}
+    if len(data) > 200:
+        for stale in sorted(data, key=lambda k: float((data[k] or {}).get("ts") or 0))[:-150]:
+            data.pop(stale, None)
+    payload = json.dumps(data, ensure_ascii=False)
+    while len(payload) > 1_500_000 and len(data) > 10:
+        oldest = min(data, key=lambda k: float((data[k] or {}).get("ts") or 0))
+        data.pop(oldest, None)
+        payload = json.dumps(data, ensure_ascii=False)
+    try:
+        WEB_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        WEB_CACHE_PATH.write_text(payload, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _search_brave(query: str, limit: int) -> list[dict[str, str]]:
+    key = os.environ.get("BRAVE_API_KEY") or ""
+    if not key:
+        return []
+    url = ("https://api.search.brave.com/res/v1/web/search?q="
+           + urllib.parse.quote_plus(query) + f"&count={limit}")
+    request = urllib.request.Request(url, headers={"X-Subscription-Token": key,
+                                                   "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8", errors="replace"))
+    rows = []
+    for item in ((data.get("web") or {}).get("results") or [])[:limit]:
+        rows.append({"title": _strip_html(str(item.get("title") or "")),
+                     "url": str(item.get("url") or ""),
+                     "snippet": _strip_html(str(item.get("description") or ""))})
+    return rows
+
+
+def _search_tavily(query: str, limit: int) -> list[dict[str, str]]:
+    key = os.environ.get("TAVILY_API_KEY") or ""
+    if not key:
+        return []
+    payload = json.dumps({"api_key": key, "query": query, "max_results": limit}).encode()
+    request = urllib.request.Request("https://api.tavily.com/search", data=payload,
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        data = json.loads(response.read().decode("utf-8", errors="replace"))
+    return [{"title": _strip_html(str(item.get("title") or "")),
+             "url": str(item.get("url") or ""),
+             "snippet": _strip_html(str(item.get("content") or ""))}
+            for item in (data.get("results") or [])[:limit]]
+
+
+def _search_exa(query: str, limit: int) -> list[dict[str, str]]:
+    key = os.environ.get("EXA_API_KEY") or ""
+    if not key:
+        return []
+    payload = json.dumps({"query": query, "numResults": limit}).encode()
+    request = urllib.request.Request("https://api.exa.ai/search", data=payload,
+                                     headers={"Content-Type": "application/json",
+                                              "x-api-key": key})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        data = json.loads(response.read().decode("utf-8", errors="replace"))
+    return [{"title": _strip_html(str(item.get("title") or "")),
+             "url": str(item.get("url") or ""),
+             "snippet": _strip_html(str(item.get("text") or item.get("summary") or ""))}
+            for item in (data.get("results") or [])[:limit]]
+
+
+def _search_bing(query: str, limit: int) -> list[dict[str, str]]:
     url = ("https://www.bing.com/search?q=" + urllib.parse.quote_plus(query)
            + f"&count={limit}&setlang=en")
+    _web_rate_limit("www.bing.com", 2.0)
     _, body = _web_get(url, timeout=25.0)
     blocks = re.split(r'<li class="b_algo"', body)[1:]
-    rows: list[str] = []
+    rows: list[dict[str, str]] = []
     for block in blocks:
         match = re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
         if not match:
@@ -5358,27 +6043,61 @@ def tool_web_search(args: dict[str, Any]) -> str:
             if found:
                 snippet = _strip_html(found.group(1))
                 break
-        rows.append(f"{len(rows) + 1}. {title}\n   {link}\n   {snippet[:400]}")
+        rows.append({"title": title, "url": link, "snippet": snippet[:400]})
         if len(rows) >= limit:
             break
+    return rows
+
+
+def tool_web_search(args: dict[str, Any]) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = max(1, min(int(args.get("max_results") or 8), 20))
+    cache_key = f"search:{limit}:{query.lower()}"
+    cached = _web_cache_get(cache_key)
+    if isinstance(cached, dict):
+        rows = cached.get("rows") or []
+        provider = str(cached.get("provider") or "cache")
+    else:
+        rows, provider = [], "none"
+        for name, search in (("brave", _search_brave), ("tavily", _search_tavily),
+                             ("exa", _search_exa), ("bing", _search_bing)):
+            try:
+                found = search(query, limit)
+            except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+                emit_web_notice(f"{name} search failed: {exc}")
+                continue
+            if found:
+                rows, provider = found, name
+                break
+        if rows:
+            _web_cache_set(cache_key, {"provider": provider, "rows": rows[:limit]})
     if not rows:
-        return (f"no results parsed for {query!r} (the search page may have been a "
-                "challenge page - try web_fetch on a known URL)")
-    return _cap("\n\n".join(rows), 12000)
+        return (f"no results for {query!r} (all search backends failed - try "
+                "web_fetch on a known URL, or export BRAVE_API_KEY)")
+    body = "\n\n".join(f"{index}. {row.get('title')}\n   {row.get('url')}\n   "
+                        f"{row.get('snippet', '')[:400]}"
+                        for index, row in enumerate(rows[:limit], 1))
+    return _cap(f"[{provider}]\n" + body, 12000)
+
+
+def emit_web_notice(message: str) -> None:
+    """Keep search-backend failures from breaking the caller."""
+    try:
+        config = load_config()
+        if bool((config.get("web") or {}).get("verbose", False)):
+            eprint(f"{PROG}: {message}")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def tool_web_fetch(args: dict[str, Any]) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         raise ValueError("url is required")
-    if not re.match(r"^https?://", url):
+    if "://" not in url:
         url = "https://" + url
-    parsed = urllib.parse.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if not host:
-        raise ValueError("url has no host")
-    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".local"):
-        raise ValueError("refusing to fetch a local address")
     limit = max(500, min(int(args.get("max_chars") or 8000), 40000))
     final_url, body = _web_get(url)
     title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
@@ -5391,7 +6110,31 @@ def tool_web_fetch(args: dict[str, Any]) -> str:
     return _cap(header + "\n" + content, limit)
 
 
-def tool_run_command(args: dict[str, Any]) -> str:
+def sandbox_prefix(root: Path) -> list[str]:
+    """bubblewrap prefix when present: read-only system, writable workspace only."""
+    config = load_config()
+    acfg = config.get("agent") or {}
+    mode = str(acfg.get("sandbox") or "auto")
+    if mode in {"none", "off", "false"}:
+        return []
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return []
+    prefix = [bwrap, "--die-with-parent", "--unshare-pid",
+              "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+              "--tmpfs", "/tmp", "--bind", str(root), str(root)]
+    # Tool caches must stay writable or pip/npm/cargo fail inside the sandbox.
+    for cache in (HOME / ".cache", HOME / ".npm", HOME / ".cargo",
+                  HOME / ".local" / "share"):
+        if cache.exists():
+            prefix += ["--bind", str(cache), str(cache)]
+    prefix += ["--chdir", str(root)]
+    if not bool(acfg.get("sandbox_network", True)):
+        prefix.append("--unshare-net")
+    return prefix + ["--"]
+
+
+def tool_run_command(args: dict[str, Any], root: Any = None) -> str:
     command = str(args.get("command") or "").strip()
     if not command:
         raise ValueError("command is required")
@@ -5399,7 +6142,9 @@ def tool_run_command(args: dict[str, Any]) -> str:
     if any(blocked in lowered for blocked in AGENT_BLOCKED_COMMANDS):
         raise ValueError("command blocked by the safety list")
     timeout = max(1, min(int(args.get("timeout_seconds") or 120), 600))
-    proc = subprocess.run(["bash", "-lc", command], cwd=os.getcwd(), capture_output=True,
+    workspace = _work_root(root)
+    argv = sandbox_prefix(workspace) + ["bash", "-lc", command]
+    proc = subprocess.run(argv, cwd=str(workspace), capture_output=True,
                           text=True, timeout=timeout, check=False)
     parts = [f"exit {proc.returncode}"]
     if proc.stdout.strip():
@@ -5519,22 +6264,68 @@ def tool_subagent(args: dict[str, Any], approve: Any = None, on_event: Any = Non
         return any(bit in text for bit in ("rate limit", "429", "timed out", "timeout",
                                           "temporarily", "overloaded", "502", "503"))
 
+    root = _work_root(ctx.get("root"))
+    isolate = bool(ctx.get("isolation", True))
+
     def work(item: dict[str, Any], worker_id: int) -> dict[str, Any]:
         started = time.time()
-        report = run_subagent(item, model=ctx.get("model") or "auto",
-                              task_hint=ctx.get("task_hint") or "coding",
-                              max_rounds=base_rounds, approve=approve,
-                              on_event=worker_events(worker_id),
-                              allow_outside=allow_outside, ctx=ctx)
-        if not report.get("ok") and retryable(report):
-            emit("subagent_start", {"worker": worker_id, "retry": True,
-                                    "files": [str(f) for f in (item.get("files") or [])],
-                                    "task": "retrying after: " + str(report.get("error") or "")[:120]})
+        assigned: list[str] = []
+        for name in item.get("files") or []:
+            try:
+                source = _tool_path(name, root=root)
+                assigned.append(str(source.relative_to(root)))
+            except ValueError:
+                continue
+        report: dict[str, Any] = {"ok": False, "error": "not attempted"}
+        for attempt in range(2):
+            scratch = Path(tempfile.mkdtemp(prefix=f"hyperrouter-w{worker_id}-")) if isolate else None
+            before: dict[str, bytes | None] = {}
+            worker_ctx = dict(ctx)
+            if scratch is not None:
+                for relative in assigned:
+                    source = root / relative
+                    if not source.is_file():
+                        continue
+                    data = source.read_bytes()
+                    before[relative] = data
+                    target = scratch / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                worker_ctx["root"] = str(scratch)
             report = run_subagent(item, model=ctx.get("model") or "auto",
                                   task_hint=ctx.get("task_hint") or "coding",
                                   max_rounds=base_rounds, approve=approve,
                                   on_event=worker_events(worker_id),
-                                  allow_outside=allow_outside, ctx=ctx)
+                                  allow_outside=False if isolate else allow_outside,
+                                  ctx=worker_ctx)
+            if scratch is not None:
+                merged: list[str] = []
+                conflicts: list[str] = []
+                if report.get("ok"):
+                    for relative in assigned:
+                        produced = scratch / relative
+                        if not produced.is_file():
+                            continue
+                        content = produced.read_bytes()
+                        original = before.get(relative)
+                        target = root / relative
+                        current = target.read_bytes() if target.is_file() else None
+                        if current != original:
+                            conflicts.append(relative)
+                            continue
+                        if content != current:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(content)
+                            merged.append(relative)
+                report["changed"] = merged
+                if conflicts:
+                    report["conflicts"] = conflicts
+                shutil.rmtree(scratch, ignore_errors=True)
+            if report.get("ok") or not retryable(report) or attempt == 1:
+                break
+            emit("subagent_start", {"worker": worker_id, "retry": True,
+                                    "files": [str(f) for f in (item.get("files") or [])],
+                                    "task": "retrying after: " + str(report.get("error") or "")[:120]})
             report["retried"] = True
         report["elapsed"] = round(time.time() - started, 1)
         return report
@@ -5550,6 +6341,8 @@ def tool_subagent(args: dict[str, Any], approve: Any = None, on_event: Any = Non
             item = dict(item, siblings=siblings)
             fut = pool.submit(work, item, worker_id)
             futures[fut] = (worker_id, item)
+            # Stagger starts so N workers do not hit the same free tier in the same ms.
+            time.sleep(min(0.6 * (worker_id - 1), 2.0))
             emit("subagent_start", {"worker": worker_id,
                                     "files": [str(f) for f in (item.get("files") or [])],
                                     "task": str(item.get("task") or "")[:200]})
@@ -5595,12 +6388,14 @@ def tool_subagent(args: dict[str, Any], approve: Any = None, on_event: Any = Non
                "workers": [{"worker": report.get("worker"), "ok": report.get("ok"),
                             "files": report.get("files") or [],
                             "changed": report.get("changed") or [],
+                            "conflicts": report.get("conflicts") or [],
                             "elapsed": report.get("elapsed"),
                             "retried": bool(report.get("retried")),
                             "error": report.get("error"),
                             "report": (report.get("response") or "")[:3000]}
                            for report in merged],
-               "changed": changed, "shared": shared, "failed": failures}
+               "isolated": isolate, "changed": changed, "shared": shared,
+               "failed": failures}
     return _cap(json.dumps(payload, ensure_ascii=False, indent=2), 16000)
 
 
@@ -5609,37 +6404,53 @@ def execute_tool(name: str, args: dict[str, Any], approve: Any = None,
                  ctx: dict[str, Any] | None = None,
                  allow_subagents: bool = True) -> str:
     ctx = ctx if isinstance(ctx, dict) else {}
+    root = ctx.get("root")
     try:
+        policy = (load_config().get("agent") or {}).get("approvals") or {}
+
+        def allow(kind: str) -> Any:
+            """Approval callback for this kind, or None when the policy is open."""
+            return approve if (approve and policy.get(kind, True)) else None
+
         if name.startswith("mcp__"):
             target = (MCP_AGENT_CACHE.get("map") or {}).get(name)
             if not target:
                 return (f"error: unknown MCP tool {name!r} - call it as exposed by "
                         "tools/list, or reload the session")
-            server, tool = target
+            if isinstance(target, dict):
+                server, tool = str(target.get("server")), str(target.get("tool"))
+                readonly = bool(target.get("readonly", True))
+            else:
+                server, tool = target  # type: ignore[misc]
+                readonly = True
+            ask = allow("mcp_write")
+            if not readonly and ask and not ask("mcp", f"{server}/{tool}", ""):
+                return "error: the user denied this MCP tool call"
             timeout = float((load_config().get("mcp") or {}).get("timeout_seconds") or 60)
             result = mcp_call(server, tool, args, timeout=max(15.0, timeout), persistent=True)
             return _cap(_mcp_text(result), int((load_config().get("agent") or {})
                                              .get("tool_result_chars") or 12000))
         if name == "read_file":
-            return tool_read_file(args)
+            return tool_read_file(args, root)
         if name == "list_dir":
-            return tool_list_dir(args)
+            return tool_list_dir(args, root)
         if name == "search":
-            return tool_search(args)
+            return tool_search(args, root)
         if name == "write_file":
-            output = tool_write_file(args, allow_outside, approve)
+            output = tool_write_file(args, allow_outside, allow("write"), root)
             if not output.startswith("error:"):
                 ctx.setdefault("changed", set()).add(str(args.get("path")))
             return output
         if name == "edit_file":
-            output = tool_edit_file(args, allow_outside, approve)
+            output = tool_edit_file(args, allow_outside, allow("edit"), root)
             if not output.startswith("error:"):
                 ctx.setdefault("changed", set()).add(str(args.get("path")))
             return output
         if name == "run_command":
-            if approve and not approve("run", str(args.get("command")), ""):
+            ask = allow("run")
+            if ask and not ask("run", str(args.get("command")), ""):
                 return "error: the user denied this command"
-            return tool_run_command(args)
+            return tool_run_command(args, root)
         if name == "web_search":
             return tool_web_search(args)
         if name == "web_fetch":
@@ -5658,6 +6469,63 @@ def execute_tool(name: str, args: dict[str, Any], approve: Any = None,
                 "list_dir, search, run_command, todo, subagent")
     except (OSError, ValueError, subprocess.SubprocessError, McpError) as exc:
         return f"error: {exc}"
+
+
+VERIFY_CANDIDATES = [
+    ("pyproject.toml", "python3 -m pytest -q"),
+    ("pytest.ini", "python3 -m pytest -q"),
+    ("setup.cfg", "python3 -m pytest -q"),
+    ("package.json", "npm test --silent"),
+    ("Cargo.toml", "cargo test -q"),
+    ("go.mod", "go test ./..."),
+]
+
+
+def detect_verify_command(root: Path) -> str:
+    config = load_config()
+    configured = str((config.get("agent") or {}).get("verify_command") or "").strip()
+    if configured:
+        return configured
+    for marker, command in VERIFY_CANDIDATES:
+        if (root / marker).is_file():
+            if marker == "package.json":
+                try:
+                    data = json.loads((root / marker).read_text(encoding="utf-8"))
+                    if not (data.get("scripts") or {}).get("test"):
+                        continue
+                except (OSError, json.JSONDecodeError):
+                    continue
+            return command
+    makefile = root / "Makefile"
+    if makefile.is_file():
+        try:
+            if re.search(r"^test:", makefile.read_text(encoding="utf-8", errors="replace"), re.M):
+                return "make test"
+        except OSError:
+            pass
+    return ""
+
+
+def run_verification(root: Path) -> dict[str, Any]:
+    config = load_config()
+    acfg = config.get("agent") or {}
+    command = detect_verify_command(root)
+    if not command:
+        return {"command": "", "ok": None, "output": "no test command detected"}
+    timeout = max(30, min(int(acfg.get("verify_timeout") or 300), 900))
+    argv = sandbox_prefix(root) + ["bash", "-lc", command]
+    try:
+        proc = subprocess.run(argv, cwd=str(root), capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {"command": command, "ok": False,
+                "output": f"timed out after {timeout}s"}
+    except OSError as exc:
+        return {"command": command, "ok": False, "output": str(exc)}
+    output = _cap((proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "")
+                  + (proc.stderr or ""), 6000).strip()
+    return {"command": command, "ok": proc.returncode == 0,
+            "exit": proc.returncode, "output": output}
 
 
 def retry_after_seconds(message: str) -> int:
@@ -5694,6 +6562,10 @@ def agent_turn(
     ctx.setdefault("depth", 0)
     ctx.setdefault("model", model)
     ctx.setdefault("task_hint", task_hint)
+    ctx.setdefault("root", str(Path.cwd()))
+    if "isolation" not in ctx:
+        ctx["isolation"] = bool((load_config().get("agent") or {})
+                                .get("subagent_isolation", True))
     if allow_subagents and ctx.get("approval_lock") is None:
         # One approval prompt at a time, even when workers run in parallel.
         ctx["approval_lock"] = threading.Lock()
@@ -5713,8 +6585,10 @@ def agent_turn(
         attempts = 0
         while True:
             try:
-                result = route_once(messages, model=model, task_hint=task_hint,
-                                    max_tokens=max_tokens, temperature=temperature, tools=tools)
+                with request_gate():
+                    result = route_once(messages, model=model, task_hint=task_hint,
+                                        max_tokens=max_tokens, temperature=temperature,
+                                        tools=tools)
                 break
             except RuntimeError as exc:
                 wait = retry_after_seconds(str(exc))
@@ -5734,7 +6608,15 @@ def agent_turn(
         text = content_to_text(message.get("content"))
         calls = message.get("tool_calls") or []
         if not calls:
-            return {"text": text, "meta": meta, "rounds": round_index + 1}
+            verification = None
+            acfg = load_config().get("agent") or {}
+            if (ctx.get("changed") and bool(acfg.get("verify", True))
+                    and int(ctx.get("depth") or 0) == 0):
+                emit("notice", {"message": "running the project's checks"})
+                verification = run_verification(_work_root(ctx.get("root")))
+                emit("verify", verification)
+            return {"text": text, "meta": meta, "rounds": round_index + 1,
+                    "verification": verification}
         messages.append({"role": "assistant", "content": text, "tool_calls": calls})
         for call in calls:
             if not isinstance(call, dict):
@@ -5767,8 +6649,9 @@ def agent_turn(
     messages.append({"role": "user", "content":
                      "Stop calling tools. Summarize what you changed and what you verified."})
     try:
-        result = route_once(messages, model=model, task_hint="summarization",
-                            max_tokens=max_tokens)
+        with request_gate():
+            result = route_once(messages, model=model, task_hint="summarization",
+                                max_tokens=max_tokens)
     except RuntimeError as exc:
         return {"text": (f"Stopped after {max_rounds} tool rounds: the free pool is rate limited "
                          f"({exc}). The tool output above is what completed; raise --max-rounds "
@@ -5838,6 +6721,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
             state_bit = "ok" if payload.get("ok") else f"failed: {payload.get('error') or ''}"
             print(f"  ++ worker {payload.get('worker')} {state_bit}"
                   + (f" (changed {changed})" if changed else ""))
+        elif kind == "verify":
+            command = payload.get("command") or "(none)"
+            state = {True: "passed", False: "failed", None: "skipped"}[payload.get("ok")]
+            print(f"  == verify {state}: {command}")
+            for line in str(payload.get("output") or "").splitlines()[:20]:
+                print(f"     {line[:200]}")
         elif kind == "notice":
             print(f"  ... {payload.get('message')}")
 
@@ -5890,6 +6779,7 @@ TUI_HELP = [
     ("Up/Down", "scroll, or browse input history"),
     ("Ctrl+L", "redraw"),
     ("y / n / a", "answer an approval after reading its diff"),
+    ("Tab", "complete an @file path"),
     ("F1 or ?", "this help"),
     ("", ""),
     ("/model", "switch model or alias"),
@@ -5899,7 +6789,9 @@ TUI_HELP = [
     ("/tools", "turn the coding tools on or off"),
     ("/todos", "show the agent's task list"),
     ("/workers", "parallel workers: state and changed files"),
-    ("/workers", "parallel workers: state and changed files"),
+    ("/image", "attach an image to the next message"),
+    ("/plan", "read-only mode: propose, do not edit"),
+    ("/undo-edit", "restore the last edited file from backup"),
     ("/skill", "load a session skill"),
     ("/skills", "list installed skills"),
     ("/mcp", "MCP servers and tools"),
@@ -5953,6 +6845,7 @@ class TuiApp:
                              else str(ccfg.get("system") or ""))
         self.skill_names = [str(x) for x in (getattr(args, "skill", None) or [])]
         self.skill_names += [str(x) for x in (ccfg.get("skills") or [])]
+        self.skill_names += [name for name in project_skills() if name not in self.skill_names]
         self.agent_backend = getattr(args, "agent", None) or None
         self.show_tokens = bool(ccfg.get("show_token_usage", True))
         self.history_limit = max(2, int(ccfg.get("history_limit") or 40))
@@ -5977,6 +6870,10 @@ class TuiApp:
         self.messages: list[dict[str, Any]] = []
         self._load_session()
         self.buffer = ""
+        self.pending_images: list[dict[str, Any]] = []
+        self.plan_mode = False
+        self.file_matches: list[str] = []
+        self.file_match_index = 0
         self.history: list[str] = []
         self.history_index = 0
         self.scroll = 0
@@ -6060,7 +6957,10 @@ class TuiApp:
 
     def _add(self, row: int, col: int, text: str, attr: int = 0) -> None:
         try:
-            self.s.addstr(row, col, text, attr)
+            height, width = self.s.getmaxyx()
+            if row < 0 or row >= height or col < 0 or col >= width:
+                return
+            self.s.addstr(row, col, clip_display(text, width - col), attr)
         except self.c.error:
             pass
 
@@ -6095,7 +6995,9 @@ class TuiApp:
             lines.extend(self._banner(width))
         for msg in self.messages:
             role = str(msg.get("role") or "")
-            text = str(msg.get("content") or "")
+            text = content_to_text(msg.get("content"))
+            if msg.get("images"):
+                text += f"\n[{len(msg['images'])} image(s) attached]"
             if role == "user":
                 wrapped = self._wrap(text, width - 8)
                 for index, line in enumerate(wrapped):
@@ -6188,6 +7090,8 @@ class TuiApp:
             segments.append("workers on")
         if self.web_tools and self.tools_enabled:
             segments.append("web")
+        if self.plan_mode:
+            segments.append("plan mode")
         segments.append(f"{len(self.messages)} msgs")
         segments.append(f"~{human_count(tokens)} ctx")
         if self.todos:
@@ -6210,6 +7114,8 @@ class TuiApp:
             self._add(height - 1, 0, self.notice[: width - 1], self._attr("yellow"))
         else:
             matches = self._command_matches()
+            if not matches and self.file_matches:
+                matches = "  @" + "   @".join(self.file_matches)
             if matches:
                 self._add(height - 1, 0, "  " + matches[: max(0, width - 3)], self.c.A_DIM)
             else:
@@ -6349,6 +7255,7 @@ class TuiApp:
                 continue
             if not self._key(key) or self.quitting:
                 break
+        close_mcp_sessions()
         self._persist()
         return 0
 
@@ -6404,6 +7311,7 @@ class TuiApp:
             return True
         if key == "\x08":
             self.buffer = self.buffer[:-1]
+            self._refresh_file_matches()
             return True
         if key in {"\x15"}:
             self.buffer = ""
@@ -6457,9 +7365,51 @@ class TuiApp:
         if key == "?" and not self.buffer:
             self._open_help()
             return True
+        if key in {"\t", c.KEY_TAB}:
+            self._complete_file()
+            return True
         if isinstance(key, str) and key.isprintable():
             self.buffer += key
+            self._refresh_file_matches()
         return True
+
+    def _refresh_file_matches(self) -> None:
+        self.file_matches = []
+        match = re.search(r"(?:^|\s)@([\w./-]*)$", self.buffer)
+        if not match:
+            return
+        stem = match.group(1)
+        root = Path.cwd()
+        skip = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build"}
+        found: list[str] = []
+        try:
+            for path in root.rglob("*"):
+                if len(found) >= 2000:
+                    break
+                if any(part in skip for part in path.parts):
+                    continue
+                if not path.is_file():
+                    continue
+                relative = str(path.relative_to(root))
+                if relative.startswith(stem):
+                    found.append(relative)
+                    if len(found) >= 8:
+                        break
+        except OSError:
+            pass
+        self.file_matches = sorted(found)[:8]
+        self.file_match_index = 0
+
+    def _complete_file(self) -> None:
+        if not self.file_matches:
+            self._refresh_file_matches()
+        if not self.file_matches:
+            return
+        choice = self.file_matches[self.file_match_index % len(self.file_matches)]
+        self.buffer = re.sub(r"(?:^|\s)@([\w./-]*)$",
+                             lambda match: match.group(0)[: match.start(1) - match.start(0)] + choice,
+                             self.buffer)
+        self.file_matches = []
 
     def _history(self, step: int) -> None:
         if not self.history:
@@ -6487,7 +7437,15 @@ class TuiApp:
         if self.enrich and not any(m.get("role") == "user" for m in self.messages):
             content = build_prompt(content, persona=chat_system_prompt(self.persona, ""),
                                    output_format="text", max_tokens=self.max_tokens)
-        self.messages.append({"role": "user", "content": content})
+        if self.pending_images:
+            parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+            for image in self.pending_images:
+                parts.append({"type": "image_url", "image_url": {"url": image["url"]}})
+            self.messages.append({"role": "user", "content": parts,
+                                  "images": [image["name"] for image in self.pending_images]})
+            self.pending_images = []
+        else:
+            self.messages.append({"role": "user", "content": content})
         self._transcript("user", content)
         self._persist()
         self.scroll = 0
@@ -6508,6 +7466,10 @@ class TuiApp:
                 system += "\n\n" + self.system_extra.strip()
         else:
             system = chat_full_system(self.persona, self.system_extra, self.skill_names)
+        if self.plan_mode:
+            system += ("\n\nPLAN MODE: read-only. Inspect the workspace and return a concrete "
+                       "plan with the files you would change. Do not edit or run commands "
+                       "that modify anything.")
         payload = ([{"role": "system", "content": system}] if system else []) \
             + self.messages[-self.history_limit:]
         return payload, self.model, self.task or "", list(self.skill_names)
@@ -6547,6 +7509,9 @@ class TuiApp:
         payload = list(payload)  # agent_turn appends tool messages to its own copy
 
         def approve(kind: str, detail: str, preview: str = "") -> bool:
+            if self.plan_mode and kind in {"write", "edit", "run", "mcp"}:
+                self.queue.put(("notice", {"message": f"plan mode blocked {kind}: {detail}"}))
+                return False
             if self.auto_approve:
                 return True
             with self.approval_lock:  # one prompt at a time, workers queue up
@@ -6573,8 +7538,6 @@ class TuiApp:
             self.queue.put(("error", str(exc)))
         except Exception as exc:  # noqa: BLE001 - shown in the UI
             self.queue.put(("error", f"{type(exc).__name__}: {exc}"))
-        finally:
-            close_mcp_sessions()
 
     def _pump(self) -> None:
         while True:
@@ -6615,6 +7578,15 @@ class TuiApp:
                     prefix = f"[w{worker}] " if worker else ""
                     self.messages.append({"role": "info",
                                           "content": f"{prefix}-> {data.get('name')} {args[:200]}"})
+                elif event_kind == "verify":
+                    command = data.get("command") or "(no checks detected)"
+                    state = {True: "passed", False: "FAILED", None: "skipped"}[data.get("ok")]
+                    self.messages.append({"role": "info",
+                                          "content": f"verify {state}: {command}"})
+                    if data.get("ok") is False:
+                        self._warn("verification failed - see the transcript")
+                    self.scroll = 0
+                    continue
                 elif event_kind == "notice":
                     self._warn(str(data.get("message") or ""))
                 elif event_kind == "tool_result":
@@ -6628,6 +7600,10 @@ class TuiApp:
                 continue
             if kind == "locked":
                 self._warn(str(payload))
+                continue
+            if kind == "notice":
+                message = payload.get("message") if isinstance(payload, dict) else payload
+                self._warn(str(message or ""))
                 continue
             self.approval = None
             if kind == "compacted":
@@ -6667,7 +7643,29 @@ class TuiApp:
         if command in {"/exit", "/quit"}:
             self.quitting = True
             return
-        if command == "/help":
+        if command == "/plan":
+            self.plan_mode = not self.plan_mode
+            self._warn("plan mode: read-only" if self.plan_mode else "plan mode off")
+        elif command == "/image":
+            if not value:
+                if self.pending_images:
+                    self._say(f"attached: {', '.join(i['name'] for i in self.pending_images)}")
+                else:
+                    self._warn("usage: /image <path.png|jpg|webp|gif>")
+            else:
+                try:
+                    self.pending_images.append(load_image_attachment(value))
+                    self._say(f"attached {Path(value).name} "
+                              f"({len(self.pending_images)} image(s) queued)")
+                except ValueError as exc:
+                    self._warn(str(exc))
+        elif command == "/undo-edit":
+            restored = restore_last_backup()
+            if restored:
+                self._say(f"restored {restored} from the last backup")
+            else:
+                self._warn("nothing to undo")
+        elif command == "/help":
             self._open_help()
         elif command == "/model":
             if value:
@@ -6933,6 +7931,38 @@ class TuiApp:
         return True
 
 
+def cmd_web(args: argparse.Namespace) -> int:
+    action = args.action or "status"
+    if action == "status":
+        providers = [("brave", "BRAVE_API_KEY"), ("tavily", "TAVILY_API_KEY"),
+                     ("exa", "EXA_API_KEY")]
+        print("search backends:")
+        for name, variable in providers:
+            state = "ready" if os.environ.get(variable) else f"off ({variable} unset)"
+            print(f"  {name:<8} {state}")
+        print("  bing     keyless fallback (HTML)")
+        cache = _web_cache_read()
+        fresh = sum(1 for entry in cache.values()
+                    if time.time() - float((entry or {}).get("ts") or 0) <= WEB_CACHE_TTL)
+        print(f"cache: {fresh} fresh / {len(cache)} entries at {WEB_CACHE_PATH}")
+        print("fetch: any public http(s) URL, private addresses refused")
+        return 0
+    if action == "search":
+        if not args.query:
+            die("usage: hyperrouter web search <query>")
+        print(tool_web_search({"query": " ".join(args.query),
+                               "max_results": args.max_results or 8}))
+        return 0
+    if action == "fetch":
+        if not args.query:
+            die("usage: hyperrouter web fetch <url>")
+        print(tool_web_fetch({"url": args.query[0],
+                              "max_chars": args.max_chars or 8000}))
+        return 0
+    die(f"unknown web action: {action}")
+    return 2
+
+
 def cmd_route(args: argparse.Namespace) -> int:
     messages: list[dict[str, Any]] = []
     persona = load_persona(args.persona) if args.persona else default_persona()
@@ -7011,12 +8041,53 @@ def split_task(text: str) -> list[str]:
 
 AGENT_BACKENDS: dict[str, dict[str, Any]] = {
     "opencode": {"command": ["opencode", "run", "--standalone", "--model", "hyperrouter/auto"],
-                 "help": "OpenCode headless (`opencode run`)", "headless": True},
+                 "help": "OpenCode headless (`opencode run`)", "headless": True,
+                 "verified": True},
     "dsh": {"command": ["dsh", "headless"],
-            "help": "DeepSeek Harness headless (`dsh headless`)", "headless": True},        "freebuff": {"command": [], "binary": "freebuff", "in_process": True,
+            "help": "DeepSeek Harness headless (`dsh headless`)", "headless": True,
+            "verified": True},
+    "claude": {"command": ["claude", "-p"],
+               "help": "Claude Code (`claude -p`) via the Anthropic /v1/messages shim",
+               "headless": True, "env_kind": "anthropic", "verified": False},
+    "codex": {"command": ["codex", "exec"],
+              "help": "OpenAI Codex (`codex exec`) via the OpenAI-compatible proxy",
+              "headless": True, "env_kind": "openai", "verified": False},
+    "aider": {"command": ["aider", "--yes", "--no-auto-commits", "--message"],
+              "help": "Aider (`aider --message`) against the proxy", "headless": True,
+              "env_kind": "openai", "verified": False},
+    "cline": {"command": ["cline"], "help": "Cline CLI (experimental)",
+              "headless": True, "env_kind": "openai", "verified": False},
+    "pi": {"command": ["pi", "-p"], "help": "Pi coding agent (experimental)",
+           "headless": True, "env_kind": "openai", "verified": False},
+    "hermes": {"command": ["hermes", "-p"], "help": "Hermes agent (experimental)",
+               "headless": True, "env_kind": "openai", "verified": False},
+    "grok": {"command": ["grok", "-p"], "help": "Grok Build CLI (experimental)",
+             "headless": True, "env_kind": "openai", "verified": False},
+    "muse": {"command": ["muse", "-p"], "help": "Muse Code CLI (experimental)",
+             "headless": True, "env_kind": "openai", "verified": False},
+    "antigravity": {"command": ["antigravity", "-p"],
+                    "help": "Antigravity CLI (experimental)", "headless": True,
+                    "env_kind": "openai", "verified": False},
+    "freebuff": {"command": [], "binary": "freebuff", "in_process": True,
                  "help": "Freebuff answered in-process by the free pool (never opens its TUI)",
-                 "headless": False},
+                 "headless": False, "verified": True},
 }
+
+
+def backend_env(backend: dict[str, Any]) -> dict[str, str]:
+    env = agent_env()
+    key = env.get("HYPERROUTER_API_KEY") or "local"
+    base = env.get("HYPERROUTER_BASE_URL") or "http://127.0.0.1:8787/v1"
+    kind = str(backend.get("env_kind") or "")
+    if kind == "anthropic":
+        env["ANTHROPIC_BASE_URL"] = base.removesuffix("/v1")
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+        env["ANTHROPIC_API_KEY"] = key
+    elif kind == "openai":
+        env["OPENAI_BASE_URL"] = base
+        env["OPENAI_API_BASE"] = base
+        env["OPENAI_API_KEY"] = key
+    return env
 
 
 def agent_env() -> dict[str, str]:
@@ -7066,7 +8137,7 @@ def run_agent(name: str, prompt: str, timeout: float = 300.0,
     ensure_service()
     try:
         proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
-                              env=agent_env(), cwd=os.getcwd(), check=False)
+                              env=backend_env(backend), cwd=os.getcwd(), check=False)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{name} timed out after {timeout:.0f}s") from None
     output = (proc.stdout or "").strip()
@@ -7084,14 +8155,16 @@ def cmd_agents(args: argparse.Namespace) -> int:
         binary = backend.get("binary") or (command[0] if command else "")
         rows.append({"name": name, "available": bool(binary and shutil.which(binary)),
                      "headless": bool(backend.get("headless") or backend.get("in_process")),
+                     "verified": bool(backend.get("verified")),
                      "help": backend.get("help")})
     if getattr(args, "json", False):
         print(json.dumps(rows, indent=2))
         return 0
     print(f"{'agent':<12} {'installed':<10} {'headless':<9} notes")
     for row in rows:
+        note = row['help'] + ("" if row["verified"] else " (flags unverified)")
         print(f"{row['name']:<12} {'yes' if row['available'] else 'no':<10} "
-              f"{'yes' if row['headless'] else 'no':<9} {row['help']}")
+              f"{'yes' if row['headless'] else 'no':<9} {note}")
     print(f"\nUse one from chat with /agent <name>, or one-shot: "
           f"{PROG} route \"...\" --agent opencode")
     return 0
@@ -7441,6 +8514,14 @@ def cmd_quota(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _curses_available() -> bool:
+    try:
+        import curses  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     catalog = load_catalog()
     accounts = discover_accounts()
@@ -7463,8 +8544,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "shell_env": ENV_BEGIN in read_text(BASHRC_PATH),
         "skills": len(discover_skills()),
         "mcp_servers": len(mcp_servers(config)),
+        "claude": CLAUDE_SETTINGS.is_file() and "ANTHROPIC_BASE_URL" in read_text(CLAUDE_SETTINGS),
     }
     opencode_env = opencode_service_env_state()
+    catalog_age = None
+    try:
+        generated = catalog.get("generated_at")
+        if generated:
+            catalog_age = round((datetime.now(timezone.utc)
+                                 - datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
+                                 ).total_seconds() / 3600, 1)
+    except (ValueError, TypeError):
+        catalog_age = None
+    web_backends = [name for name, variable in (("brave", "BRAVE_API_KEY"),
+                                                ("tavily", "TAVILY_API_KEY"),
+                                                ("exa", "EXA_API_KEY"))
+                    if os.environ.get(variable)] or ["bing"]
     data = {
         "version": VERSION,
         "catalog": {"path": str(CATALOG_PATH), "models": len(catalog.get("models") or []),
@@ -7478,6 +8573,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                  "source": key_source()},
         "integrations": integrations,
         "opencode_service_env": opencode_env,
+        "catalog_age_hours": catalog_age,
+        "web": {"backends": web_backends,
+                "cache_entries": len(_web_cache_read())},
+        "sandbox": {"bwrap": bool(shutil.which("bwrap")),
+                    "mode": str((config.get("agent") or {}).get("sandbox") or "auto")},
+        "platform": {"python": sys.version.split()[0], "curses": _curses_available(),
+                     "windows": os.name == "nt"},
     }
     if args.json:
         print(json.dumps(data, indent=2))
@@ -7498,6 +8600,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             print(f"  {name}: {'ok' if ok else 'missing'}")
     print(f"  opencode_service_env: {opencode_env}")
+    print(f"Catalog age: {catalog_age if catalog_age is not None else 'unknown'} h"
+          + ("  (refresh: hyperrouter catalog --refresh)" if catalog_age and catalog_age > 24 else ""))
+    print(f"Web: {', '.join(web_backends)}  cache={data['web']['cache_entries']} entries")
+    print(f"Sandbox: {'bwrap' if data['sandbox']['bwrap'] else 'none'} "
+          f"(mode={data['sandbox']['mode']})")
+    print(f"Python {data['platform']['python']}  curses={data['platform']['curses']}")
+    if data["platform"]["windows"] and not data["platform"]["curses"]:
+        print("  hint: pip install windows-curses for the full-screen TUI on Windows")
     if opencode_env == "missing":
         print("  hint: restart OpenCode from a shell that sourced ~/.bashrc, "
               "or run `hyperrouter run opencode --standalone`.")
@@ -7508,20 +8618,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    config = load_config()
-    host = str(config.get("server", {}).get("host") or "127.0.0.1")
-    port = int(config.get("server", {}).get("port") or 8787)
-    env = os.environ.copy()
-    env["HYPERROUTER_BASE_URL"] = f"http://{host}:{port}/v1"
-    local_key = load_api_key() or os.environ.get("HYPERROUTER_API_KEY") or "local"
-    env["HYPERROUTER_API_KEY"] = local_key
-    env["HYPERROUTER_HOME"] = str(DATA_HOME)
-    commands = {
-        "opencode": ["opencode"],
-        "freebuff": ["freebuff"],
-        "dsh": ["dsh", "--profile", "headless"],
-    }
-    command = commands[args.target]
+    backend = AGENT_BACKENDS.get(args.target)
+    if backend is None:
+        die(f"unknown agent: {args.target} (choose from {', '.join(AGENT_BACKENDS)})")
+    env = backend_env(backend)
+    base_command = list(backend.get("command") or [])
+    if not base_command:
+        base_command = [str(backend.get("binary") or args.target)]
+    if args.target == "dsh":
+        base_command = ["dsh", "--profile", "headless"]
+    elif args.target == "opencode":
+        base_command = ["opencode"]
+    command = base_command
     extra = list(args.args or [])
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -7531,9 +8639,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run = True
     command = command + extra
     executable = shutil.which(command[0])
-    if executable is None:
+    if executable is None and not dry_run:
         die(f"{command[0]} is not installed or not on PATH")
-    command[0] = executable
+    if executable:
+        command[0] = executable
     if args.target == "opencode" and "--standalone" not in extra:
         if opencode_service_env_state() == "missing":
             eprint("hyperrouter: warning: OpenCode's background service was started without "
@@ -7541,8 +8650,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                    "that sourced ~/.bashrc.")
     if dry_run:
         print(f"HYPERROUTER_BASE_URL={env['HYPERROUTER_BASE_URL']} "
-              f"HYPERROUTER_API_KEY=<set:{len(env['HYPERROUTER_API_KEY'])} chars> {shlex_join(command)}")
+              f"ANTHROPIC_BASE_URL={env.get('ANTHROPIC_BASE_URL', '-')} "
+              f"OPENAI_BASE_URL={env.get('OPENAI_BASE_URL', '-')} "
+              f"HYPERROUTER_API_KEY=<set:{len(env['HYPERROUTER_API_KEY'])} chars> "
+              f"{shlex_join(command)}")
         return 0
+    ensure_service()
     os.execvpe(executable, command, env)
     return 0
 
@@ -7970,6 +9083,108 @@ def cmd_sources(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def repo_dir_for_update() -> Path | None:
+    script = Path(__file__).resolve()
+    for parent in script.parents:
+        if (parent / ".git").exists():
+            return parent
+    for candidate in (HOME / "Projects" / "hyperRouter", Path.cwd()):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def main_commands(parser: argparse.ArgumentParser) -> list[str]:
+    for action in parser._actions:  # noqa: SLF001 - argparse has no public API
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return list(action.choices)
+    return []
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    repo = repo_dir_for_update()
+    if repo is None:
+        die("no git checkout found; clone https://github.com/9ssault/hyperRouter and "
+            "set HYPERROUTER_REPO to its path")
+    fetch = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet"],
+                           capture_output=True, text=True, timeout=120, check=False)
+    if fetch.returncode != 0:
+        die(f"git fetch failed: {fetch.stderr.strip()[:200]}")
+    local = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+    remote = subprocess.run(["git", "-C", str(repo), "rev-parse", "origin/main"],
+                            capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+    behind = local != remote
+    report: dict[str, Any] = {"repo": str(repo), "version": VERSION, "local": local,
+                              "remote": remote, "behind": behind, "updated": False}
+    if behind and not args.check:
+        pull = subprocess.run(["git", "-C", str(repo), "pull", "--ff-only", "--quiet"],
+                              capture_output=True, text=True, timeout=180, check=False)
+        if pull.returncode != 0:
+            die(f"git pull failed: {pull.stderr.strip()[:200]}")
+        source = repo / "hyperrouter"
+        target = Path(__file__).resolve()
+        if source.is_file() and source.resolve() != target:
+            backup(target)
+            shutil.copy2(source, target)
+        report["updated"] = True
+        try:
+            report["new_version"] = re.search(r'^VERSION = "([^"]+)"',
+                                              source.read_text(encoding="utf-8"), re.M).group(1)
+        except (OSError, AttributeError):
+            report["new_version"] = "unknown"
+    if args.json:
+        print(json.dumps(report, indent=2))
+    elif behind and not args.check:
+        print(f"updated {repo} {local[:8]} -> {remote[:8]}; installed version "
+              f"{report.get('new_version') or VERSION}")
+    elif behind:
+        print(f"update available: {local[:8]} -> {remote[:8]} (run without --check to apply)")
+    else:
+        print(f"already up to date at {local[:8]} (hyperrouter {VERSION})")
+    return 0
+
+
+def cmd_completions(args: argparse.Namespace) -> int:
+    parser = build_parser()
+    commands = main_commands(parser)
+    shell = args.shell
+    if shell == "bash":
+        print(f"complete -W \"{' '.join(commands)}\" {PROG}")
+        print(f"complete -o default -W \"--help --version\" {PROG}")
+    elif shell == "zsh":
+        print(f"#compdef {PROG}")
+        print(f"_arguments '1:command:({' '.join(commands)})' '*::arg:->args'")
+    else:
+        print(f"complete -c {PROG} -f -a \"{' '.join(commands)}\"")
+        print(f"complete -c {PROG} -l help -d 'show help'")
+        print(f"complete -c {PROG} -l version -d 'show version'")
+    return 0
+
+
+def cmd_man(args: argparse.Namespace) -> int:
+    parser = build_parser()
+    commands = main_commands(parser)
+    lines = [f".TH {PROG.upper()} 1 \"{datetime.now():%Y-%m-%d}\" \"{PRODUCT} {VERSION}\" \"User Commands\"",
+             ".SH NAME", f"{PROG} \\- free-model router and terminal coding agent",
+             ".SH SYNOPSIS", f".B {PROG}", ".RI [ command ] [ options ]",
+             ".SH DESCRIPTION", f"{PRODUCT} routes requests across free model providers, "
+             "runs a full-screen agent with tools, and delegates to OpenCode, "
+             "Freebuff or DeepSeek Harness. Run with no command to open the TUI.",
+             ".SH COMMANDS"]
+    for action in parser._actions:  # noqa: SLF001
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            for name, sub in action.choices.items():
+                help_text = (sub.description or "").splitlines()[0] if sub.description else ""
+                lines.append(f".TP\n.B {name}\n{help_text or 'see'} " + f"\\({PROG} {name} --help\\)")
+            break
+    lines += [".SH FILES", f"~/.config/hyperrouter/config.json",
+              f"~/.local/share/hyperrouter/router.db",
+              ".SH SEE ALSO", f"{PROG} doctor, {PROG} settings"]
+    print("\n".join(lines))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -8077,10 +9292,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_route)
 
+    p = sub.add_parser("web", help="check, search and fetch from the web")
+    p.add_argument("action", nargs="?", default="status",
+                   choices=["status", "search", "fetch"])
+    p.add_argument("query", nargs="*")
+    p.add_argument("--max-results", dest="max_results", type=int, default=8)
+    p.add_argument("--max-chars", dest="max_chars", type=int, default=8000)
+    p.set_defaults(func=cmd_web)
+
+    p = sub.add_parser("update", help="pull a newer hyperRouter and reinstall the script")
+    p.add_argument("--check", action="store_true", help="report without changing anything")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("completions", help="print shell completion for bash, zsh or fish")
+    p.add_argument("shell", choices=["bash", "zsh", "fish"])
+    p.set_defaults(func=cmd_completions)
+
+    p = sub.add_parser("man", help="print a roff man page for this CLI")
+    p.set_defaults(func=cmd_man)
+
     p = sub.add_parser("skills", help="list, inspect and install Agent Skills (SKILL.md)")
     p.add_argument("action", nargs="?", default="list",
                    choices=["list", "show", "install", "install-defaults", "defaults",
-                            "sync", "remove", "path"])
+                            "sync", "update", "trust", "dedupe", "pin", "unpin",
+                            "remove", "path"])
     p.add_argument("target", nargs="?")
     p.add_argument("--search")
     p.add_argument("--json", action="store_true")
@@ -8088,8 +9324,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("mcp", help="manage and call MCP servers")
     p.add_argument("action", nargs="?", default="list",
-                   choices=["list", "add", "add-rea", "defaults", "remove", "enable",
-                            "disable", "test", "tools", "call"])
+                   choices=["list", "add", "add-rea", "defaults", "restart", "update",
+                            "remove", "enable", "disable", "test", "tools", "call"])
     p.add_argument("name", nargs="?")
     p.add_argument("tool", nargs="?")
     p.add_argument("--command")
@@ -8235,7 +9471,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_keys)
 
     p = sub.add_parser("setup", help="wire the router into OpenCode, Freebuff, and DSH")
-    p.add_argument("target", nargs="?", default="all", choices=["all", "opencode", "freebuff", "dsh"])
+    p.add_argument("target", nargs="?", default="all",
+                   choices=["all", "opencode", "freebuff", "dsh", "claude"])
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-key", action="store_true", help="do not auto-generate a router key")
@@ -8245,7 +9482,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("run", help="launch an agent with router environment variables")
-    p.add_argument("target", choices=["opencode", "freebuff", "dsh"])
+    p.add_argument("target", choices=sorted(AGENT_BACKENDS))
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_run)
