@@ -57,7 +57,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2150,6 +2150,20 @@ def note_provider_failure(provider: str, status: int, error: str) -> None:
     cool_provider(provider, wait)
 
 
+def routing_failure(errors: list[dict[str, Any]], skipped: list[str]) -> RuntimeError:
+    """Explain an exhausted route without pretending nothing was tried."""
+    parts = [f"{e.get('provider')}/{e.get('model')} HTTP {e.get('status')}: {e.get('error')}"
+             for e in errors]
+    if skipped:
+        waits = [provider_cooling(name) for name in skipped]
+        parts.append(f"{len(skipped)} provider(s) cooling down for up to {max(waits):.0f}s")
+    message = "all free candidates failed: " + ("; ".join(parts) or "no candidate was tried")
+    if any(int(e.get("status") or 0) in {402, 429} for e in errors):
+        message += (". Free tiers are rate limited right now - retry in a moment or add a "
+                    "provider key with `hyperrouter connect <provider>`")
+    return RuntimeError(message)
+
+
 def request_gate() -> threading.Semaphore:
     """Limit concurrent upstream calls so parallel workers do not stampede."""
     config = load_config()
@@ -2175,6 +2189,7 @@ def route_once(
         messages, model=model, task_hint=task_hint, strategy=strategy,
         max_tokens=max_tokens, temperature=temperature, tools=tools)
     errors = []
+    skipped: list[str] = []
     failed_accounts: set[str] = set()
     per_timeout = float(timeout) if timeout else routing_timeout()
     deadline = time.monotonic() + routing_timeout(total=True)
@@ -2184,6 +2199,7 @@ def route_once(
             continue
         provider_name = str(candidate["model"].get("provider") or "")
         if provider_cooling(provider_name) > 0:
+            skipped.append(provider_name)
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 1:
@@ -2200,9 +2216,7 @@ def route_once(
                               str(result.get("error") or ""))
         if account_wide_error(int(result.get("status") or 0)):
             failed_accounts.add(str(account.get("id")))
-    raise RuntimeError("all free candidates failed: " + "; ".join(
-        f"{e.get('provider')}/{e.get('model')} HTTP {e.get('status')}: {e.get('error')}" for e in errors
-    ))
+    raise routing_failure(errors, skipped)
 
 
 def stream_route(
@@ -2224,12 +2238,17 @@ def stream_route(
         max_tokens=max_tokens, temperature=temperature)
     meta = meta if meta is not None else {}
     errors: list[dict[str, Any]] = []
+    skipped: list[str] = []
     failed_accounts: set[str] = set()
     per_timeout = routing_timeout()
     deadline = time.monotonic() + routing_timeout(total=True)
     for candidate in candidates:
         account = candidate.get("account") or {}
         if account.get("id") in failed_accounts:
+            continue
+        cooling = provider_cooling(str(candidate["model"].get("provider") or ""))
+        if cooling > 0:
+            skipped.append(str(candidate["model"].get("provider") or ""))
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 1:
@@ -2268,6 +2287,7 @@ def stream_route(
                            (time.monotonic() - started) * 1000, raw)
             errors.append({"provider": provider, "model": upstream_model,
                            "status": exc.code, "error": redact(raw)[:300]})
+            note_provider_failure(provider, exc.code, raw)
             if account_wide_error(exc.code):
                 failed_accounts.add(str(account.get("id")))
             continue
@@ -2277,6 +2297,7 @@ def stream_route(
                            (time.monotonic() - started) * 1000, message)
             errors.append({"provider": provider, "model": upstream_model,
                            "status": 0, "error": redact(message)[:300]})
+            note_provider_failure(provider, 0, message)
             continue
         produced = 0
         usage_in = 0
@@ -2348,9 +2369,7 @@ def stream_route(
                            (time.monotonic() - started) * 1000, str(exc))
             meta["error"] = redact(str(exc))
             return
-    raise RuntimeError("all free candidates failed: " + "; ".join(
-        f"{e.get('provider')}/{e.get('model')} HTTP {e.get('status')}: {e.get('error')}"
-        for e in errors))
+    raise routing_failure(errors, skipped)
 
 
 def _anthropic_blocks_text(content: Any) -> str:
@@ -2514,9 +2533,11 @@ class RouterHandler:
         self.wfile.write(raw)
 
     def read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
-        data = json.loads(raw.decode("utf-8", "replace"))
+        raw = getattr(self, "_raw_body", None)
+        if raw is None:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+        data = json.loads((raw or b"{}").decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("body must be a JSON object")
         return data
@@ -2626,6 +2647,12 @@ class RouterHandler:
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        # Drain the body even for 404/401 so a kept-alive socket stays in sync.
+        self._raw_body = self.rfile.read(length) if length else b""
         if path not in {"/v1/chat/completions", "/v1/completions", "/v1/messages",
                         "/v1/messages/count_tokens"}:
             self.send_json(404, {"error": {"message": "not found", "type": "not_found"}})
@@ -2682,6 +2709,50 @@ class RouterHandler:
         self.wfile.write(raw.encode("utf-8"))
         self.wfile.flush()
 
+    def stream_anthropic_text(self, messages: list[dict[str, Any]], model: str,
+                              max_tokens: int | None, temperature: Any) -> None:
+        """True token streaming for text-only Claude requests."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        input_tokens = max(1, estimate_tokens(messages_to_text(messages)))
+        self.sse("message_start", {"type": "message_start", "message": {
+            "id": message_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})
+        self.sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                         "content_block": {"type": "text", "text": ""}})
+        meta: dict[str, Any] = {}
+        started = time.time()
+        first = True
+        try:
+            for piece in stream_route(messages, model=model, max_tokens=max_tokens,
+                                      temperature=(float(temperature)
+                                                   if temperature is not None else None),
+                                      meta=meta):
+                if not piece:
+                    continue
+                if first:
+                    meta.setdefault("first_token_ms", round((time.time() - started) * 1000, 1))
+                    first = False
+                self.sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": piece}})
+        except RuntimeError as exc:
+            self.sse("error", {"type": "error", "error": {
+                "type": "overloaded_error", "message": redact(str(exc))}})
+            return
+        except BrokenPipeError:
+            return
+        self.sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+        output_tokens = int(meta.get("tokens_out") or 0)
+        self.sse("message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                    "usage": {"output_tokens": output_tokens}})
+        self.sse("message_stop", {"type": "message_stop"})
+
     def handle_anthropic(self, body: dict[str, Any]) -> None:
         messages, tools = anthropic_to_openai(body)
         if not messages:
@@ -2691,6 +2762,9 @@ class RouterHandler:
         requested = self.anthropic_model(str(body.get("model") or "auto"))
         max_tokens = int(body.get("max_tokens") or 0) or None
         temperature = body.get("temperature")
+        if body.get("stream") and not tools:
+            self.stream_anthropic_text(messages, requested, max_tokens, temperature)
+            return
         try:
             result = route_once(messages, model=requested, max_tokens=max_tokens,
                                 temperature=float(temperature) if temperature is not None else None,
@@ -2885,7 +2959,7 @@ class RouterHandler:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                self.send_header("Connection", "close")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 self.wfile.write(first)
@@ -2952,7 +3026,8 @@ def make_handler() -> type:
     from http.server import BaseHTTPRequestHandler
 
     class Handler(RouterHandler, BaseHTTPRequestHandler):
-        pass
+        # Keep-alive halves the latency of the many short calls coding agents make.
+        protocol_version = "HTTP/1.1"
 
     return Handler
 
@@ -2964,6 +3039,7 @@ def serve(host: str, port: int) -> int:
     load_catalog()
     handler = make_handler()
     httpd = ThreadingHTTPServer((host, port), handler)
+    httpd.daemon_threads = True
     eprint(f"hyperrouter {VERSION} listening on http://{host}:{port}/v1")
     eprint(f"catalog: {CATALOG_PATH}")
     try:
@@ -5091,6 +5167,8 @@ CHAT_COMMANDS = {
     "/save [path]": "save the conversation",
     "/load <path>": "load a saved conversation",
     "/retry": "resend the last user message",
+    "/find [text]": "filter the transcript to matching messages",
+    "/keys": "show keyboard shortcuts",
     "/clear": "forget the conversation",
     "/new": "start a fresh session",
     "/undo": "remove the last exchange",
@@ -5484,6 +5562,21 @@ def cmd_chat_plain(args: argparse.Namespace) -> int:
                 if messages:
                     messages.pop()
                 send(str(last_user.get("content") or ""))
+        elif command == "/keys":
+            for key, desc in TUI_HELP:
+                if key or desc:
+                    print(f"  {key:<12} {desc}")
+        elif command == "/find":
+            if not value:
+                print("usage: /find <text> - the full-screen TUI filters the transcript live")
+            else:
+                hits = [m for m in messages
+                        if value.lower() in content_to_text(m.get("content")).lower()]
+                if not hits:
+                    print(f"no messages match {value!r}")
+                for index, msg in enumerate(hits[-12:], 1):
+                    preview = content_to_text(msg.get("content")).replace("\n", " ")[:160]
+                    print(f"  {index}. {msg.get('role')}: {preview}")
         elif command in {"/tag", "/tokens"}:
             show_tag = not show_tag
             print(f"router tag: {'on' if show_tag else 'off'}")
@@ -6743,7 +6836,13 @@ def cmd_agent(args: argparse.Namespace) -> int:
             return True
         return answer in {"y", "yes"}
 
+    json_events = bool(getattr(args, "json_events", False))
+
     def on_event(kind: str, payload: dict[str, Any]) -> None:
+        if json_events:
+            print(json.dumps({"event": kind, "data": payload}, ensure_ascii=False,
+                             default=str), flush=True)
+            return
         if kind == "tool":
             print(f"  -> {payload.get('name')} "
                   f"{json.dumps(payload.get('arguments') or {}, ensure_ascii=False)[:240]}")
@@ -6788,9 +6887,17 @@ def cmd_agent(args: argparse.Namespace) -> int:
                             and not getattr(args, "no_subagents", False))
     except RuntimeError as exc:
         close_mcp_sessions()
+        if json_events:
+            print(json.dumps({"event": "error", "data": {"message": str(exc)}},
+                             ensure_ascii=False), flush=True)
+            return 1
         die(str(exc))
     finally:
         close_mcp_sessions()
+    if json_events:
+        print(json.dumps({"event": "final", "data": {"task": task, "result": result}},
+                         ensure_ascii=False, default=str), flush=True)
+        return 0
     if args.json:
         print(json.dumps({"task": task, "result": result}, indent=2, default=str))
         return 0
@@ -6819,6 +6926,8 @@ TUI_HELP = [
     ("Ctrl+S", "settings summary"),
     ("Ctrl+K", "start a new conversation"),
     ("Ctrl+C", "cancel a running request"),
+    ("Ctrl+R", "retry the last message"),
+    ("Ctrl+F", "filter the transcript (/find)"),
     ("Ctrl+D", "quit"),
     ("PgUp/PgDn", "scroll the transcript"),
     ("Up/Down", "scroll, or browse input history"),
@@ -6844,6 +6953,9 @@ TUI_HELP = [
     ("/compact", "summarize the conversation"),
     ("/export", "save the conversation as markdown"),
     ("/session", "show the session file"),
+    ("/retry", "resend the last user message"),
+    ("/find", "filter the transcript; no argument clears it"),
+    ("/keys", "keyboard shortcuts"),
     ("/clear", "forget the conversation"),
 ]
 
@@ -6919,6 +7031,15 @@ class TuiApp:
         self.plan_mode = False
         self.file_matches: list[str] = []
         self.file_match_index = 0
+        self.file_index: list[str] | None = None
+        self.file_index_at = 0.0
+        self.filter = ""
+        self.lines_cache: tuple[Any, list[tuple[str, int]]] | None = None
+        self.stream_cache: tuple[Any, list[str]] | None = None
+        self.ctx_tokens = 0
+        self.ctx_cache: tuple[Any, int] | None = None
+        self.stream_started = 0.0
+        self.first_chunk = 0.0
         self.history: list[str] = []
         self.history_index = 0
         self.scroll = 0
@@ -6942,7 +7063,7 @@ class TuiApp:
         except self.c.error:
             pass
         self.s.keypad(True)
-        self.s.timeout(80)
+        self.s.timeout(40)
         try:
             self.c.start_color()
             self.c.use_default_colors()
@@ -7034,13 +7155,19 @@ class TuiApp:
         ]
         return [(line[: width - 1], attr) for line, attr in art]
 
-    def _render_lines(self, width: int) -> list[tuple[str, int]]:
+    def _message_lines(self, width: int) -> list[tuple[str, int]]:
+        key = (width, len(self.messages), self.show_tokens, self.filter)
+        if self.lines_cache and self.lines_cache[0] == key:
+            return self.lines_cache[1]
         lines: list[tuple[str, int]] = []
-        if not self.messages and not self.busy:
-            lines.extend(self._banner(width))
+        needle = self.filter.lower()
+        matches = 0
         for msg in self.messages:
             role = str(msg.get("role") or "")
             text = content_to_text(msg.get("content"))
+            if needle and needle not in text.lower() and needle not in role:
+                continue
+            matches += 1
             if msg.get("images"):
                 text += f"\n[{len(msg['images'])} image(s) attached]"
             if role == "user":
@@ -7059,19 +7186,32 @@ class TuiApp:
                     bits = [f"{meta.get('provider')}/{meta.get('model')}"]
                     if meta.get("latency_ms"):
                         bits.append(f"{float(meta['latency_ms']) / 1000:.1f}s")
-                    if self.show_tokens and (meta.get("tokens_in") or meta.get("tokens_out")):
-                        bits.append(f"{human_count(meta.get('tokens_in', 0))} in / "
-                                    f"{human_count(meta.get('tokens_out', 0))} out")
+                    if meta.get("tokens_out"):
+                        bits.append(f"{human_count(meta.get('tokens_out', 0))} out tok")
                     tag = "  ◆ " + " · ".join(bits)
                 if tag:
                     lines.append((tag, self._attr("magenta", self.c.A_DIM)))
                 for line in self._wrap(text, width - 4):
                     lines.append(("   " + line, 0))
                 lines.append(("", 0))
+        if needle:
+            lines.insert(0, (f"  filter: {self.filter} · {matches} message(s) · /find to clear",
+                             self._attr("yellow")))
+            lines.insert(1, ("", 0))
+        self.lines_cache = (key, lines)
+        return lines
+
+    def _render_lines(self, width: int) -> list[tuple[str, int]]:
+        lines: list[tuple[str, int]] = []
+        if not self.messages and not self.busy and not self.filter:
+            lines.extend(self._banner(width))
+        lines.extend(self._message_lines(width))
         if self.busy:
             if self.stream_buf:
-                body = self._wrap(self.stream_buf, width - 4)
-                for line in body:
+                key = (width, len(self.stream_buf))
+                if self.stream_cache is None or self.stream_cache[0] != key:
+                    self.stream_cache = (key, self._wrap(self.stream_buf, width - 4))
+                for line in self.stream_cache[1]:
                     lines.append(("   " + line, 0))
                 lines.append(("   ▌", self._attr("cyan")))
             else:
@@ -7123,12 +7263,23 @@ class TuiApp:
             placeholder = "ask for a change, a fix or an explanation — /help for commands"
             self._add(height - 3, len(prompt), placeholder[: available], self.c.A_DIM)
         try:
-            self.s.move(height - 3, min(width - 1, len(prompt) + len(shown)))
+            self.s.move(height - 3, min(width - 1, len(prompt) + display_width(shown)))
         except self.c.error:
             pass
 
-        tokens = estimate_tokens("\n".join(str(m.get("content") or "") for m in self.messages))
+        token_key = (len(self.messages), len(str(self.messages[-1].get("content") or ""))
+                     if self.messages else 0)
+        if self.ctx_cache is None or self.ctx_cache[0] != token_key:
+            self.ctx_tokens = estimate_tokens("\n".join(
+                str(m.get("content") or "") for m in self.messages))
+            self.ctx_cache = (token_key, self.ctx_tokens)
+        tokens = self.ctx_tokens
         state = "working" if self.busy else "ready"
+        if self.busy and self.stream_started:
+            elapsed = max(0.0, (time.monotonic() if not self.first_chunk else self.first_chunk)
+                          - self.stream_started)
+            state = (f"streaming {elapsed:.1f}s" if self.stream_buf
+                     else f"waiting {elapsed:.1f}s")
         done = sum(1 for item in self.todos if str(item.get("status")) == "completed")
         segments = [state, f"tools {'on' if self.tools_enabled else 'off'}"]
         if self.subagents and self.tools_enabled:
@@ -7137,6 +7288,8 @@ class TuiApp:
             segments.append("web")
         if self.plan_mode:
             segments.append("plan mode")
+        if self.filter:
+            segments.append(f"find '{self.filter}'")
         segments.append(f"{len(self.messages)} msgs")
         segments.append(f"~{human_count(tokens)} ctx")
         if self.todos:
@@ -7145,7 +7298,7 @@ class TuiApp:
         if running:
             segments.append(f"{running} worker{'s' if running != 1 else ''} running")
         status = " " + "  │  ".join(segments)
-        hint = ("Enter send · ^P model · ^O usage · ? help · ^D quit"
+        hint = ("Enter send · ^P model · ^R retry · ^F find · ^O usage · ? help · ^D quit"
                 if width > 92 else "^P model · ^D quit")
         self._add(height - 2, 0, status[: width - 1], self.c.A_DIM)
         if len(status) + len(hint) + 2 < width:
@@ -7290,6 +7443,9 @@ class TuiApp:
             if self.notice and time.monotonic() > self.notice_until:
                 self.notice = ""
             self._draw()
+            # Idle screens block on the keyboard instead of redrawing 12x a second.
+            active = self.busy or bool(self.notice)
+            self.s.timeout(40 if active else -1)
             try:
                 key = self.s.get_wch()
             except self.c.error:
@@ -7374,6 +7530,12 @@ class TuiApp:
         if key == "\x10":
             self._open_model_picker()
             return True
+        if key == "\x12":
+            self._retry()
+            return True
+        if key == "\x06":
+            self.buffer = "/find "
+            return True
         if key == "\x0f":
             self._open_usage()
             return True
@@ -7410,7 +7572,7 @@ class TuiApp:
         if key == "?" and not self.buffer:
             self._open_help()
             return True
-        if key in {"\t", c.KEY_TAB}:
+        if key in {"\t", getattr(c, "KEY_TAB", "\t")}:
             self._complete_file()
             return True
         if isinstance(key, str) and key.isprintable():
@@ -7418,31 +7580,47 @@ class TuiApp:
             self._refresh_file_matches()
         return True
 
-    def _refresh_file_matches(self) -> None:
-        self.file_matches = []
-        match = re.search(r"(?:^|\s)@([\w./-]*)$", self.buffer)
-        if not match:
-            return
-        stem = match.group(1)
+    def _file_index(self) -> list[str]:
+        """Walk the tree once, not on every keystroke."""
+        if self.file_index is not None and time.monotonic() - self.file_index_at < 30:
+            return self.file_index
         root = Path.cwd()
-        skip = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build"}
+        skip = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+                ".mypy_cache", ".pytest_cache", "target", ".next"}
         found: list[str] = []
         try:
             for path in root.rglob("*"):
-                if len(found) >= 2000:
+                if len(found) >= 5000:
                     break
                 if any(part in skip for part in path.parts):
                     continue
                 if not path.is_file():
                     continue
-                relative = str(path.relative_to(root))
-                if relative.startswith(stem):
-                    found.append(relative)
-                    if len(found) >= 8:
-                        break
+                found.append(str(path.relative_to(root)))
         except OSError:
             pass
-        self.file_matches = sorted(found)[:8]
+        self.file_index = sorted(found)
+        self.file_index_at = time.monotonic()
+        return self.file_index
+
+    def _refresh_file_matches(self) -> None:
+        self.file_matches = []
+        match = re.search(r"(?:^|\s)@([\w./-]*)$", self.buffer)
+        if not match:
+            return
+        needle = match.group(1).lower()
+        prefix: list[str] = []
+        fuzzy: list[str] = []
+        for relative in self._file_index():
+            lowered = relative.lower()
+            if lowered.startswith(needle):
+                prefix.append(relative)
+                if len(prefix) >= 8:
+                    break
+            elif needle and len(fuzzy) < 8 and all(
+                    char in lowered for char in needle):
+                fuzzy.append(relative)
+        self.file_matches = (prefix or fuzzy)[:8]
         self.file_match_index = 0
 
     def _complete_file(self) -> None:
@@ -7464,6 +7642,25 @@ class TuiApp:
         self.buffer = self.history[self.history_index]
 
     # -- running a request ------------------------------------------------
+
+    def _retry(self) -> None:
+        if self.busy:
+            self._warn("a request is already running - Ctrl+C cancels")
+            return
+        last = None
+        for index in range(len(self.messages) - 1, -1, -1):
+            if self.messages[index].get("role") == "user":
+                last = index
+                break
+        if last is None:
+            self._warn("nothing to retry yet")
+            return
+        text = content_to_text(self.messages[last].get("content"))
+        del self.messages[last:]
+        self._persist()
+        self.buffer = text
+        self._warn(f"retrying: {text[:60]}")
+        self._submit()
 
     def _submit(self) -> None:
         text = self.buffer.strip()
@@ -7495,7 +7692,10 @@ class TuiApp:
         self._persist()
         self.scroll = 0
         self.stream_buf = ""
+        self.stream_cache = None
         self.busy = True
+        self.stream_started = time.monotonic()
+        self.first_chunk = 0.0
         self.cancel.clear()
         payload, model, task, skills = self._payload()
         target = self._worker
@@ -7591,6 +7791,8 @@ class TuiApp:
             except queue.Empty:
                 break
             if kind == "chunk":
+                if not self.first_chunk:
+                    self.first_chunk = time.monotonic()
                 self.stream_buf += str(payload)
                 continue
             if kind == "approve":
@@ -7661,6 +7863,8 @@ class TuiApp:
                 self._warn("compacted - earlier turns replaced")
                 continue
             self.busy = False
+            self.stream_started = 0.0
+            self.first_chunk = 0.0
             self.cancel.clear()
             if kind == "error":
                 self.stream_buf = ""
@@ -7668,6 +7872,7 @@ class TuiApp:
                 self._persist()
                 continue
             text, meta = payload
+            self.stream_cache = None
             if not str(text).strip():
                 self.messages.append({"role": "info",
                                       "content": "error: empty response from the free pool"})
@@ -7837,8 +8042,17 @@ class TuiApp:
                       f"model: {self.model}")
         elif command == "/clear" or command == "/new":
             self.messages = []
+            self.filter = ""
             self._persist()
             self._warn("new conversation")
+        elif command == "/retry":
+            self._retry()
+        elif command == "/find":
+            self.filter = value
+            self.scroll = 0
+            self._warn(f"filter: {value}" if value else "filter cleared")
+        elif command == "/keys":
+            self._open_help()
         elif command == "/undo":
             removed = 0
             while self.messages and removed < 2:
@@ -8091,10 +8305,10 @@ AGENT_BACKENDS: dict[str, dict[str, Any]] = {
     "dsh": {"command": ["dsh", "headless"],
             "help": "DeepSeek Harness headless (`dsh headless`)", "headless": True,
             "verified": True},
-    "claude": {"command": ["claude", "-p"],
+    "claude": {"command": ["claude", "-p"], "npx": "@anthropic-ai/claude-code",
                "help": "Claude Code (`claude -p`) via the Anthropic /v1/messages shim",
                "headless": True, "env_kind": "anthropic", "verified": False},
-    "codex": {"command": ["codex", "exec"],
+    "codex": {"command": ["codex", "exec"], "npx": "@openai/codex",
               "help": "OpenAI Codex (`codex exec`) via the OpenAI-compatible proxy",
               "headless": True, "env_kind": "openai", "verified": False},
     "aider": {"command": ["aider", "--yes", "--no-auto-commits", "--message"],
@@ -8175,7 +8389,13 @@ def run_agent(name: str, prompt: str, timeout: float = 300.0,
                            f"or chat here for the same free models")
     command = list(backend["command"])
     if not shutil.which(command[0]):
-        raise RuntimeError(f"{command[0]} is not installed or not on PATH")
+        # Fall back to the npm package instead of demanding a global install.
+        package = str(backend.get("npx") or "")
+        if package and shutil.which("npx"):
+            command = ["npx", "-y", package] + command[1:]
+        else:
+            raise RuntimeError(f"{command[0]} is not installed or not on PATH"
+                               + (f" (or run it with: npx -y {package})" if package else ""))
     if name == "opencode" and session:
         command += ["--session", session]
     command.append(prompt)
@@ -8193,25 +8413,85 @@ def run_agent(name: str, prompt: str, timeout: float = 300.0,
     return output
 
 
+def agent_available(backend: dict[str, Any]) -> bool:
+    command = list(backend.get("command") or [])
+    binary = backend.get("binary") or (command[0] if command else "")
+    if backend.get("in_process"):
+        return True
+    if binary and shutil.which(binary):
+        return True
+    return bool(backend.get("npx") and shutil.which("npx"))
+
+
+def check_agent(name: str, timeout: float = 120.0) -> dict[str, Any]:
+    """Prove a harness end-to-end: our proxy answers, its flags work, we parse output."""
+    prompt = "Reply with exactly the word pong and nothing else."
+    started = time.monotonic()
+    record: dict[str, Any] = {"agent": name, "ok": False, "latency_ms": 0,
+                              "checked_at": utc_now()}
+    try:
+        answer = run_agent(name, prompt, timeout=timeout)
+        record.update(ok="pong" in answer.lower(), output=answer.strip()[:200])
+        if not record["ok"]:
+            record["error"] = "answered, but not with pong"
+    except (RuntimeError, OSError) as exc:
+        record["error"] = redact(str(exc))[:300]
+    record["latency_ms"] = int((time.monotonic() - started) * 1000)
+    return record
+
+
 def cmd_agents(args: argparse.Namespace) -> int:
+    config = load_config()
+    stored = config.get("agent_checks") if isinstance(config.get("agent_checks"), dict) else {}
+    target = getattr(args, "test", None)
+    if target is not None:
+        names = [target] if target else [name for name, backend in AGENT_BACKENDS.items()
+                                         if agent_available(backend)]
+        if not names:
+            print("no agent harness is installed; install one or use the built-in free pool")
+            return 1
+        failures = 0
+        for name in names:
+            if name not in AGENT_BACKENDS:
+                print(f"unknown agent: {name}", file=sys.stderr)
+                return 2
+            print(f"testing {name} ...", flush=True)
+            record = check_agent(name)
+            stored[name] = record
+            state = "ok" if record["ok"] else "FAILED"
+            print(f"  {state}  {record['latency_ms']} ms  {record.get('output') or record.get('error')}")
+            failures += 0 if record["ok"] else 1
+        config["agent_checks"] = stored
+        save_config(config)
+        return 1 if failures else 0
     rows = []
     for name, backend in AGENT_BACKENDS.items():
         command = list(backend.get("command") or [])
         binary = backend.get("binary") or (command[0] if command else "")
-        rows.append({"name": name, "available": bool(binary and shutil.which(binary)),
+        check = stored.get(name) or {}
+        rows.append({"name": name, "available": agent_available(backend),
                      "headless": bool(backend.get("headless") or backend.get("in_process")),
-                     "verified": bool(backend.get("verified")),
+                     "verified": bool(check.get("ok")) or bool(backend.get("verified")),
+                     "checked": check or None,
                      "help": backend.get("help")})
     if getattr(args, "json", False):
         print(json.dumps(rows, indent=2))
         return 0
-    print(f"{'agent':<12} {'installed':<10} {'headless':<9} notes")
+    print(f"{'agent':<12} {'available':<10} {'headless':<9} notes")
     for row in rows:
-        note = row['help'] + ("" if row["verified"] else " (flags unverified)")
+        check = row.get("checked") or {}
+        note = row['help']
+        if check.get("ok"):
+            note += f" (verified {check.get('latency_ms', 0)} ms)"
+        elif check:
+            note += " (last test FAILED)"
+        elif not row["verified"]:
+            note += " (flags unverified)"
         print(f"{row['name']:<12} {'yes' if row['available'] else 'no':<10} "
               f"{'yes' if row['headless'] else 'no':<9} {note}")
     print(f"\nUse one from chat with /agent <name>, or one-shot: "
           f"{PROG} route \"...\" --agent opencode")
+    print(f"Prove the installed harnesses work: {PROG} agents --test")
     return 0
 
 
@@ -9649,6 +9929,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("agents", help="list agent backends usable inside hyperRouter")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--test", nargs="?", const="", metavar="NAME",
+                   help="run a real one-shot through each installed harness (or NAME)")
     p.set_defaults(func=cmd_agents)
 
     p = sub.add_parser("tui", help="full-screen chat and agent TUI")
@@ -9691,6 +9973,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not let the agent spawn parallel workers")
     p.add_argument("--skill", action="append", default=[])
     p.add_argument("--json", action="store_true")
+    p.add_argument("--json-events", dest="json_events", action="store_true",
+                   help="stream NDJSON events (tool, tool_result, verify, final)")
     p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("serve", help="run the OpenAI-compatible proxy")

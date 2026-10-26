@@ -214,10 +214,17 @@ Around the agent:
 - `/undo-edit` restores the file from the most recent edit backup.
 - `/plan` is read-only mode; `/workers` shows worker state; `/tools` disables the loop.
 
-Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+O` usage, `Ctrl+U` clear line,
-`Ctrl+K` new conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help,
-`PgUp/PgDn` scroll. `/tools` turns the tools off for a plain chat, `/todos` shows
-the agent's task list.
+Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+R` retry the last message,
+`Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U` clear line, `Ctrl+K` new
+conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help, `PgUp/PgDn` scroll.
+`/tools` turns the tools off for a plain chat, `/todos` shows the agent's task list,
+`/find <text>` hides non-matching turns (`/find` clears), and `/keys` lists every
+shortcut.
+
+The screen redraws at 25 fps only while a request is running; when idle it blocks on
+the keyboard, so a parked TUI uses no CPU. Rendered turns and the streaming buffer
+are cached per width, and `@file` completion walks the tree once and reuses the index
+for 30 seconds instead of rescanning on every keystroke.
 
 ### Safety and verification
 
@@ -250,7 +257,7 @@ backends.
 ```
 /help /model /models /task /strategy /temp /max /stream /enrich
 /system /persona /file /usage /settings /sources /save /load
-/history /undo /new /compact /export /session /retry /clear
+/history /undo /new /compact /export /session /retry /find /keys /clear
 /skills /skill <name> /mcp [server] /agent <name|off> /init /exit
 ```
 
@@ -278,7 +285,8 @@ stability and context fit.
 
 ```bash
 hyperrouter setup all --start     # clients, skills and web servers, then start the proxy
-hyperrouter agents                # every harness, installed + verified flags
+hyperrouter agents                # every harness, available + verification state
+hyperrouter agents --test         # prove each installed harness with a real prompt
 hyperrouter run claude            # Claude Code against the Anthropic shim
 hyperrouter run codex             # Codex against the OpenAI-compatible proxy
 hyperrouter run aider             # Aider with OPENAI_BASE_URL pointed at us
@@ -287,9 +295,12 @@ hyperrouter run dsh
 ```
 
 Supported harnesses: OpenCode, DeepSeek Harness, Claude Code, Codex, Aider, Cline,
-Pi, Hermes, Grok Build, Muse Code, Antigravity, and Freebuff (in-process). The last
-seven are launched with `-p`/`--message` conventions and marked *(flags unverified)*
-in `hyperrouter agents` until their CLI's non-interactive syntax is confirmed. Every
+Pi, Hermes, Grok Build, Muse Code, Antigravity, and Freebuff (in-process). Harnesses
+with an npm package (`claude`, `codex`) run through `npx -y` when the binary is not
+installed, so `hyperrouter run claude` works without a global install. Harnesses
+whose non-interactive syntax has not been exercised are marked *(flags unverified)*;
+`hyperrouter agents --test [name]` sends one real prompt through each available
+harness, records pass/fail plus latency in the config, and marks it verified. Every
 harness gets the router environment (`HYPERROUTER_*`, plus `ANTHROPIC_BASE_URL` or
 `OPENAI_BASE_URL`/`OPENAI_API_KEY` as appropriate) and one-shot use goes through the
 same free pool.
@@ -311,8 +322,11 @@ hyperrouter setup claude
 claude -p "explain this repo"      # runs on the free pool, no Anthropic key
 ```
 
-Streaming is translated from a completed free-model response, so tokens arrive in
-one batch rather than incrementally. Tool calls stream as a single `input_json_delta`.
+Text-only requests stream token by token: `/v1/messages` forwards each upstream
+delta as a `content_block_delta` as it arrives (a 56-delta reply was measured
+arriving over 1.1 s, median gap 19 ms). Requests with tools still translate a
+completed reply, with each tool call as one `input_json_delta`, because a tool call
+must be complete before it can be executed.
 
 ### Feature parity, reworked
 
@@ -522,7 +536,7 @@ get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, coo
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t . -v   # 40 tests, offline, stdlib only
+python3 -m unittest discover -s tests -t . -v   # 66 tests, offline, stdlib only
 python3 -m compileall -q hyperrouter            # syntax gate
 ./install.sh --dry-run                          # what the installer would do
 bash -n contrib/hyperrouter.bash                # completion syntax
@@ -530,16 +544,15 @@ bash -n contrib/hyperrouter.bash                # completion syntax
 
 The suite covers the diff/approval path, tool sandboxing and path escape, SSRF
 refusals, subagent overlap and isolation/conflict merging, verification success and
-failure, skill pinning, verify-command detection and display-width handling. CI runs
-the same suite on Python 3.11 and 3.13 (`.github/workflows/ci.yml`). Tests redirect
-HOME and XDG to a temp directory and set `HYPERROUTER_NO_MCP=1`, so they never touch
-your config or spawn a server.
+failure, skill pinning, verify-command detection, display-width handling, TUI render
+caching and transcript filtering, retry rewinding, routing error explanations, and
+harness availability checks. CI runs the same suite on Python 3.11 and 3.13
+(`.github/workflows/ci.yml`). Tests redirect HOME and XDG to a temp directory and set
+`HYPERROUTER_NO_MCP=1`, so they never touch your config or spawn a server.
 
 `pyproject.toml` is PEP 621 metadata for editors and scanners; it deliberately
 declares no console script because setuptools cannot ship the extension-less
 `hyperrouter` file as a module. `install.sh` is the supported install path.
-
-## Licence
 
 ## The proxy
 
@@ -554,6 +567,14 @@ Any OpenAI-compatible client can point at `/v1`; Claude Code can point at
 `/v1/messages` instead (see above). Model aliases: `auto`,
 `auto-coding`, `auto-reasoning`, `auto-long`, `auto-vision`, `auto-fast`,
 `auto-quality`, `auto-cheap`, `auto-agentic`.
+
+The proxy speaks HTTP/1.1 with keep-alive, so the many short calls a coding harness
+makes reuse one socket (two back-to-back completions were verified on the same
+connection); streaming responses close the connection after the final event.
+
+`hyperrouter agent --json-events` emits one NDJSON object per line for external
+frontends: `{"event":"tool","data":{...}}`, `tool_result`, `verify`, `todos`,
+`subagent_start/done`, `notice`, and a final `{"event":"final","data":{...}}`.
 
 ## Licence
 
