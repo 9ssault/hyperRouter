@@ -44,6 +44,10 @@ class VersionAndParserTest(unittest.TestCase):
         self.assertEqual(checked.test, "")
         named = parser.parse_args(["agents", "--test", "dsh"])
         self.assertEqual(named.test, "dsh")
+        bench = parser.parse_args(["bench", "--rounds", "2", "--json"])
+        self.assertIs(bench.func, hr.cmd_bench)
+        self.assertEqual(bench.rounds, 2)
+        self.assertTrue(bench.json)
         skills = parser.parse_args(["skills", "list"])
         self.assertIs(skills.func, hr.cmd_skills)
         self.assertEqual(skills.action, "list")
@@ -59,6 +63,19 @@ class VersionAndParserTest(unittest.TestCase):
         self.assertGreaterEqual(int(hr.DEFAULT_CONFIG["agent"]["max_rounds"]), 1)
         self.assertIn("routing", hr.DEFAULT_CONFIG)
         self.assertIn("mcp", hr.DEFAULT_CONFIG)
+
+
+class BenchFormattingTest(unittest.TestCase):
+    def test_milliseconds_and_seconds(self):
+        self.assertEqual(hr.bench_ms(None), "-")
+        self.assertEqual(hr.bench_ms(850), "850ms")
+        self.assertEqual(hr.bench_ms(1500), "1.5s")
+
+    def test_provider_is_not_repeated_in_the_label(self):
+        self.assertEqual(hr.bench_label("pollinations", "pollinations/openai-fast"),
+                         "pollinations/openai-fast")
+        self.assertEqual(hr.bench_label("groq", "llama-3"), "groq/llama-3")
+        self.assertEqual(hr.bench_label("", "local"), "local")
 
 
 class SkillRegistryTest(WorkingDirectoryTest):

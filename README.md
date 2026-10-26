@@ -54,6 +54,7 @@ hyperrouter chat                         # same TUI; --plain for a REPL
 hyperrouter chat "explain this traceback" --session debug
 hyperrouter route "summarize this" --model auto-coding
 hyperrouter delegate "1. design the schema 2. write the migration 3. review it"
+hyperrouter bench --rounds 5               # first-token and total latency per model
 hyperrouter usage --days 7 --by model
 hyperrouter settings
 ```
@@ -217,6 +218,8 @@ Around the agent:
 Keys: `Enter` send, `Ctrl+P` model picker, `Ctrl+R` retry the last message,
 `Ctrl+F` filter the transcript, `Ctrl+O` usage, `Ctrl+U` clear line, `Ctrl+K` new
 conversation, `Ctrl+C` cancel, `Ctrl+D` quit, `F1`/`?` help, `PgUp/PgDn` scroll.
+The mouse wheel scrolls the transcript, and clicking a command or `@file` hint in
+the bottom row fills the input; overlay rows are clickable too.
 `/tools` turns the tools off for a plain chat, `/todos` shows the agent's task list,
 `/find <text>` hides non-matching turns (`/find` clears), and `/keys` lists every
 shortcut.
@@ -266,6 +269,20 @@ backends.
 - Every answer ends with the model that produced it, latency and token counts.
 - Transcripts are JSONL under `~/.local/share/hyperrouter/transcripts/`.
 - `chat --enrich` and `chat.auto_enrich` enrich the first prompt automatically.
+
+## Benchmark
+
+```bash
+hyperrouter bench --rounds 5          # probe the top five free models
+hyperrouter bench --provider groq     # one provider
+hyperrouter bench --json              # rows, errors, fastest
+```
+
+Each probe is a real streamed completion. The table reports time to first token
+(the number that decides whether the TUI feels alive), total time, characters and
+the failure when a provider refuses or rate-limits. `--timeout` bounds one model.
+The fastest successful row is printed last; `--json` returns the same data for
+scripts.
 
 ## Task delegation
 
@@ -536,7 +553,7 @@ get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, coo
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t . -v   # 66 tests, offline, stdlib only
+python3 -m unittest discover -s tests -t . -v   # 72 tests, offline, stdlib only
 python3 -m compileall -q hyperrouter            # syntax gate
 ./install.sh --dry-run                          # what the installer would do
 bash -n contrib/hyperrouter.bash                # completion syntax

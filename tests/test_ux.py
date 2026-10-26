@@ -10,6 +10,12 @@ class FakeCurses:
     A_BOLD = 0
     A_DIM = 0
     A_REVERSE = 0
+    BUTTON4_PRESSED = 1
+    BUTTON5_PRESSED = 2
+    BUTTON1_CLICKED = 4
+    BUTTON1_PRESSED = 8
+    KEY_MOUSE = 409
+    error = Exception
 
     @staticmethod
     def color_pair(_pair):
@@ -64,6 +70,46 @@ class TranscriptCacheTest(unittest.TestCase):
         app.filter = ""
         lines = app._message_lines(80)
         self.assertFalse(any("filter:" in line for line, _ in lines))
+
+
+class MouseAndClickTest(unittest.TestCase):
+    def test_wheel_scrolls_the_transcript(self):
+        app = fake_tui()
+        app.scroll = 0
+        app.c = SimpleNamespace(BUTTON4_PRESSED=1, BUTTON5_PRESSED=2, error=Exception,
+                                getmouse=lambda: (0, 0, 0, 0, 1))
+        app._mouse()
+        self.assertEqual(app.scroll, 3)
+        app.c.getmouse = lambda: (0, 0, 0, 0, 2)
+        app._mouse()
+        self.assertEqual(app.scroll, 0)
+
+    def test_click_on_a_command_hint_fills_the_input(self):
+        app = fake_tui()
+        app.buffer = ""
+        app._click(("command", "/help"))
+        self.assertEqual(app.buffer, "/help ")
+
+    def test_click_on_a_file_hint_completes_the_at_path(self):
+        app = fake_tui()
+        app.buffer = "see @sr"
+        app.file_matches = ["src/app.py"]
+        app._click(("file", "src/app.py"))
+        self.assertEqual(app.buffer, "see @src/app.py")
+        self.assertEqual(app.file_matches, [])
+
+    def test_click_on_a_model_row_chooses_it(self):
+        app = fake_tui()
+        app.model = "auto"
+        app.overlay = {"kind": "model", "title": "Pick", "index": 0,
+                       "items": [{"label": "a", "value": "auto-fast"},
+                                 {"label": "b", "value": "auto-coding"}]}
+        warnings = []
+        app._warn = warnings.append
+        app._click(("overlay", 1))
+        self.assertEqual(app.model, "auto-coding")
+        self.assertIsNone(app.overlay)
+        self.assertTrue(warnings)
 
 
 class RetryTest(unittest.TestCase):

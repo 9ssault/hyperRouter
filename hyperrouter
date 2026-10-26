@@ -57,7 +57,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 PRODUCT = "hyperRouter"
 PROG = "hyperrouter"
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2227,6 +2227,7 @@ def stream_route(
     max_tokens: int | None = None,
     temperature: float | None = None,
     meta: dict[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> Iterator[str]:
     """Stream tokens from the best free model, failing over before the first token.
 
@@ -2240,7 +2241,7 @@ def stream_route(
     errors: list[dict[str, Any]] = []
     skipped: list[str] = []
     failed_accounts: set[str] = set()
-    per_timeout = routing_timeout()
+    per_timeout = float(timeout) if timeout else routing_timeout()
     deadline = time.monotonic() + routing_timeout(total=True)
     for candidate in candidates:
         account = candidate.get("account") or {}
@@ -6932,6 +6933,7 @@ TUI_HELP = [
     ("PgUp/PgDn", "scroll the transcript"),
     ("Up/Down", "scroll, or browse input history"),
     ("Ctrl+L", "redraw"),
+    ("Mouse", "wheel scrolls; click a hint or overlay row"),
     ("y / n / a", "answer an approval after reading its diff"),
     ("Tab", "complete an @file path"),
     ("F1 or ?", "this help"),
@@ -7036,6 +7038,7 @@ class TuiApp:
         self.filter = ""
         self.lines_cache: tuple[Any, list[tuple[str, int]]] | None = None
         self.stream_cache: tuple[Any, list[str]] | None = None
+        self.click_targets: list[tuple[int, int, int, tuple[str, Any]]] = []
         self.ctx_tokens = 0
         self.ctx_cache: tuple[Any, int] | None = None
         self.stream_started = 0.0
@@ -7064,6 +7067,10 @@ class TuiApp:
             pass
         self.s.keypad(True)
         self.s.timeout(40)
+        try:
+            self.c.mousemask(self.c.ALL_MOUSE_EVENTS)
+        except (self.c.error, AttributeError):
+            pass
         try:
             self.c.start_color()
             self.c.use_default_colors()
@@ -7222,6 +7229,7 @@ class TuiApp:
 
     def _draw(self) -> None:
         self.s.erase()
+        self.click_targets = []
         height, width = self.s.getmaxyx()
         if height < TUI_MIN_HEIGHT or width < TUI_MIN_WIDTH:
             self._add(0, 0, f"terminal too small ({width}x{height}) - need "
@@ -7311,11 +7319,19 @@ class TuiApp:
         elif self.notice:
             self._add(height - 1, 0, self.notice[: width - 1], self._attr("yellow"))
         else:
-            matches = self._command_matches()
-            if not matches and self.file_matches:
-                matches = "  @" + "   @".join(self.file_matches)
-            if matches:
-                self._add(height - 1, 0, "  " + matches[: max(0, width - 3)], self.c.A_DIM)
+            items: list[tuple[str, tuple[str, Any]]] = [
+                (name, ("command", name)) for name in self._command_match_items()]
+            if not items and self.file_matches:
+                items = [(f"@{path}", ("file", path)) for path in self.file_matches]
+            if items:
+                col = 2
+                for label, action in items:
+                    if col >= width - 2:
+                        break
+                    shown = label[: max(0, width - col - 1)]
+                    self._add(height - 1, col, shown, self.c.A_DIM)
+                    self.click_targets.append((height - 1, col, col + display_width(shown) - 1, action))
+                    col += display_width(shown) + 3
             else:
                 self._add(height - 1, 0, f"  {self.agent_backend or self.model} · "
                                           f"enrich {'on' if self.enrich else 'off'} · "
@@ -7382,12 +7398,18 @@ class TuiApp:
         self._add(top + box_h - 2, left + box_w - 1, "│", border)
         self._add(top + box_h - 1, left, "╰" + "─" * inner + "╯", border)
 
-    def _command_matches(self) -> str:
+    def _command_match_items(self) -> list[str]:
         if not self.buffer.startswith("/") or " " in self.buffer:
-            return ""
+            return []
         names = [name.split(" ")[0] for name in CHAT_COMMANDS]
-        hits = [name for name in names if name.startswith(self.buffer)][:6]
-        return "  ".join(hits) if hits else ""
+        seen: list[str] = []
+        for name in names:
+            if name.startswith(self.buffer) and name not in seen:
+                seen.append(name)
+        return seen[:6]
+
+    def _command_matches(self) -> str:
+        return "  ".join(self._command_match_items())
 
     def _draw_overlay(self, height: int, width: int) -> None:
         overlay = self.overlay or {}
@@ -7401,19 +7423,24 @@ class TuiApp:
         left = max(1, (width - box_w) // 2)
         border = self._attr("cyan")
         inner = box_w - 2
+        for row in range(box_h):
+            self._add(top + row, left + 1, " " * inner)
         self._add(top, left, "╭" + "─" * inner + "╮", border)
         self._add(top + 1, left, "│", border)
         self._add(top + 1, left + 2, title[: inner - 2], self._attr("cyan", self.c.A_BOLD))
         self._add(top + 1, left + box_w - 1, "│", border)
         self._add(top + 2, left, "├" + "─" * inner + "┤", border)
-        index = int(overlay.get("index") or 0)
+        index = int(overlay.get("index") if overlay.get("index") is not None else 0)
         rows = max(1, box_h - 6)
         start = 0
         if len(items) > rows:
-            start = max(0, min(index - (rows - 1) // 2, len(items) - rows))
+            start = max(0, min(max(0, index) - (rows - 1) // 2, len(items) - rows))
         for row in range(rows):
             pos = row + start
             self._add(top + 3 + row, left, "│", border)
+            if pos < len(items):
+                self.click_targets.append((top + 3 + row, left + 1, left + box_w - 2,
+                                           ("overlay", pos)))
             if pos >= len(items):
                 self._add(top + 3 + row, left + 1, " " * inner)
                 self._add(top + 3 + row, left + box_w - 1, "│", border)
@@ -7426,7 +7453,7 @@ class TuiApp:
         self._add(top + box_h - 2, left, "├" + "─" * inner + "┤", border)
         self._add(top + box_h - 1, left, "│", border)
         self._add(top + box_h - 1, left + 2, footer[: inner - 2], self.c.A_DIM)
-        if len(items) > rows:
+        if len(items) > rows and index >= 0:
             counter = f" {index + 1}/{len(items)} "
             self._add(top + box_h - 1, left + max(2, box_w - len(counter) - 2),
                       counter, self.c.A_DIM)
@@ -7454,8 +7481,15 @@ class TuiApp:
                 key = "\x03"
             if key == self.c.KEY_RESIZE:
                 continue
+            if key == getattr(self.c, "KEY_MOUSE", None):
+                self._mouse()
+                continue
             if not self._key(key) or self.quitting:
                 break
+        try:
+            self.c.mousemask(0)
+        except (self.c.error, AttributeError):
+            pass
         close_mcp_sessions()
         self._persist()
         return 0
@@ -7467,6 +7501,40 @@ class TuiApp:
     def _warn(self, text: str) -> None:
         self.notice = text
         self.notice_until = time.monotonic() + 5
+
+    def _mouse(self) -> None:
+        """Wheel scrolls the transcript; a click activates a hint or overlay row."""
+        try:
+            _, mx, my, _, button = self.c.getmouse()
+        except (self.c.error, AttributeError):
+            return
+        if button & getattr(self.c, "BUTTON4_PRESSED", 0):
+            self.scroll += 3
+            return
+        if button & getattr(self.c, "BUTTON5_PRESSED", 0):
+            self.scroll = max(0, self.scroll - 3)
+            return
+        if button & (getattr(self.c, "BUTTON1_CLICKED", 0)
+                     | getattr(self.c, "BUTTON1_PRESSED", 0)):
+            for row, left, right, action in reversed(self.click_targets):
+                if row == my and left <= mx <= right:
+                    self._click(action)
+                    return
+
+    def _click(self, action: tuple[str, Any]) -> None:
+        kind, value = action
+        if kind == "command":
+            self.buffer = str(value) + " "
+            return
+        if kind == "file":
+            self.buffer = re.sub(r"(?:^|\s)@([\w./-]*)$",
+                                 lambda match: match.group(0)[
+                                     : match.start(1) - match.start(0)] + str(value),
+                                 self.buffer)
+            self.file_matches = []
+            return
+        if kind == "overlay":
+            self._overlay_choose(int(value))
 
     def _key(self, key: Any) -> bool:
         c = self.c
@@ -8181,13 +8249,24 @@ class TuiApp:
             elif key in {self.c.KEY_NPAGE}:
                 self.overlay["index"] = min(len(items) - 1, index + 10)
             elif key in {"\n", "\r", self.c.KEY_ENTER} and items:
-                self.model = str(items[index].get("value") or self.model)
-                self.overlay = None
-                self._warn(f"model: {self.model}")
+                self._overlay_choose(index)
             return True
         if key in {"\n", "\r", self.c.KEY_ENTER}:
             self.overlay = None
         return True
+
+    def _overlay_choose(self, position: int) -> None:
+        if not self.overlay:
+            return
+        items = self.overlay.get("items") or []
+        if not items:
+            self.overlay = None
+            return
+        item = items[max(0, min(len(items) - 1, position))]
+        if self.overlay.get("kind") == "model":
+            self.model = str(item.get("value") or self.model)
+            self._warn(f"model: {self.model}")
+        self.overlay = None
 
 
 def cmd_web(args: argparse.Namespace) -> int:
@@ -8278,6 +8357,91 @@ def cmd_route(args: argparse.Namespace) -> int:
             print(f"\n[{PRODUCT}: {router.get('provider')}/{router.get('model')} "
                   f"task={router.get('task')} latency={router.get('latency_ms')}ms]", file=sys.stderr)
     return 0
+
+
+def bench_ms(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value / 1000:.1f}s" if value >= 1000 else f"{value:.0f}ms"
+
+
+def bench_label(provider: Any, model: Any) -> str:
+    """`pollinations` + `pollinations/openai-fast` should not repeat the provider."""
+    name = str(model or "?")
+    owner = str(provider or "")
+    return name if owner and name.startswith(owner + "/") else f"{owner}/{name}" if owner else name
+
+
+def bench_candidate(candidate: dict[str, Any], task: str, prompt: str,
+                    max_tokens: int, timeout: float) -> dict[str, Any]:
+    """One streamed probe: time to first token, total time, and the failure if any."""
+    model_meta = candidate.get("model") or {}
+    row: dict[str, Any] = {
+        "provider": model_meta.get("provider"), "model": model_meta.get("id"),
+        "task": task, "ok": False, "ttft_ms": None, "total_ms": None,
+        "chars": 0, "error": "",
+    }
+    started = time.monotonic()
+    meta: dict[str, Any] = {}
+    try:
+        for piece in stream_route([{"role": "user", "content": prompt}],
+                                  model=str(model_meta.get("id") or "auto"),
+                                  task_hint=task, max_tokens=max_tokens, timeout=timeout,
+                                  meta=meta):
+            if row["ttft_ms"] is None:
+                row["ttft_ms"] = (time.monotonic() - started) * 1000
+            row["chars"] += len(piece)
+        row["ok"] = row["chars"] > 0
+        if not row["ok"]:
+            row["error"] = "empty reply"
+    except RuntimeError as exc:
+        row["error"] = redact(str(exc))[:240]
+    row["total_ms"] = (time.monotonic() - started) * 1000
+    row["tokens_out"] = meta.get("tokens_out")
+    return row
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Measure what actually matters for an interactive agent: first token, then total."""
+    task = normalize_task(args.task or "coding")
+    prompt = args.prompt or "Reply with exactly: pong"
+    candidates = pick_models(task, limit=200 if args.provider else max(1, args.rounds),
+                             strategy=args.strategy)
+    if args.provider:
+        wanted = args.provider.lower()
+        candidates = [c for c in candidates
+                      if str((c.get("model") or {}).get("provider") or "").lower() == wanted
+                      or wanted in str((c.get("model") or {}).get("provider") or "").lower()]
+        candidates = candidates[: max(1, args.rounds)]
+    if not candidates:
+        die("no free model is available to benchmark; refresh the catalog or add a key")
+    rows: list[dict[str, Any]] = []
+    if not args.json:
+        print(f"bench: {len(candidates)} model(s) · task {task} · prompt {prompt!r}")
+        print(f"{'provider/model':<46} {'first':>7} {'total':>7} {'chars':>6}")
+    for candidate in candidates:
+        row = bench_candidate(candidate, task, prompt, max(1, args.max_tokens), args.timeout)
+        rows.append(row)
+        if not args.json:
+            name = bench_label(row["provider"], row["model"])
+            state = "" if row["ok"] else "  FAILED"
+            print(f"{name:<46} {bench_ms(row['ttft_ms']):>7} {bench_ms(row['total_ms']):>7} "
+                  f"{row['chars']:>6}{state}", flush=True)
+            if row["error"]:
+                print(f"  {row['error']}", flush=True)
+    working = [row for row in rows if row["ok"]]
+    fastest = min(working, key=lambda row: (row["ttft_ms"] or 1e9,
+                                            row["total_ms"] or 1e9)) if working else None
+    if args.json:
+        print(json.dumps({"task": task, "prompt": prompt, "rows": rows,
+                          "fastest": fastest, "generated_at": utc_now()}, indent=2))
+        return 0 if working else 1
+    if fastest:
+        print(f"\nfastest first token: {bench_label(fastest['provider'], fastest['model'])} "
+              f"({bench_ms(fastest['ttft_ms'])}, {bench_ms(fastest['total_ms'])} total)")
+    else:
+        print("\nno model completed the probe")
+    return 0 if working else 1
 
 
 def split_task(text: str) -> list[str]:
@@ -9843,6 +10007,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_route)
+
+    p = sub.add_parser("bench", help="measure first-token and total latency of free models")
+    p.add_argument("--rounds", type=int, default=5, help="how many models to probe")
+    p.add_argument("--task", default="coding")
+    p.add_argument("--strategy", choices=list(STRATEGIES))
+    p.add_argument("--provider", help="probe one provider only")
+    p.add_argument("--prompt", help="prompt used for the probe")
+    p.add_argument("--max-tokens", type=int, default=32)
+    p.add_argument("--timeout", type=float, default=90.0, help="seconds per model")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("web", help="check, search and fetch from the web")
     p.add_argument("action", nargs="?", default="status",
