@@ -28,7 +28,6 @@ import threading
 import difflib
 import hashlib
 import hmac
-import ipaddress
 import itertools
 import json
 import math
@@ -38,7 +37,6 @@ import secrets
 import signal
 import sqlite3
 import sys
-import tempfile
 import textwrap
 import time
 import unicodedata
@@ -65,6 +63,8 @@ def _lazy_module(name: str) -> Any:
 
 # These pull in ssl, http.client and the email parser (about 100 ms). Nothing
 # needs them for --help, settings, catalog reads or the TUI at launch.
+# Keep this list honest: a module-level *use* of one of them (a class base, a
+# decorator, a constant) loads it eagerly and gives the time back.
 urllib.request = _lazy_module("urllib.request")
 urllib.error = _lazy_module("urllib.error")
 urllib.parse = _lazy_module("urllib.parse")
@@ -73,6 +73,8 @@ shutil = _lazy_module("shutil")
 socket = _lazy_module("socket")
 uuid = _lazy_module("uuid")
 cfutures = _lazy_module("concurrent.futures")
+tempfile = _lazy_module("tempfile")
+ipaddress = _lazy_module("ipaddress")
 
 _LIB_DIR = Path(__file__).resolve().parent
 if str(_LIB_DIR) not in sys.path:
@@ -974,7 +976,20 @@ def discover_accounts(config: dict[str, Any] | None = None) -> list[dict[str, An
             "source": "config",
         })
 
-    # Environment-discovered accounts.
+    # Environment-discovered accounts. Index the environment once instead of
+    # probing base, base_2..base_9, base_ALT and base_BACKUP for every provider.
+    env_index: dict[str, list[str]] = {}
+    for name, value in os.environ.items():
+        if not value.strip():
+            continue
+        env_index.setdefault(name, []).append(name)
+        if name.endswith("_ALT"):
+            env_index.setdefault(name[:-4], []).append(name)
+        elif name.endswith("_BACKUP"):
+            env_index.setdefault(name[:-7], []).append(name)
+        elif len(name) > 2 and name[-2] == "_" and name[-1].isdigit():
+            env_index.setdefault(name[:-2], []).append(name)
+
     routable_providers = {
         str(m.get("provider")) for m in (catalog.get("models") or [])
         if isinstance(m, dict) and m.get("routable")
@@ -984,22 +999,23 @@ def discover_accounts(config: dict[str, Any] | None = None) -> list[dict[str, An
             continue
         env_names = account_env_names(provider)
         found = False
+        names: list[str] = []
         for base in env_names:
-            candidates = [base] + [f"{base}_{i}" for i in range(2, 10)] + [f"{base}_ALT", f"{base}_BACKUP"]
-            for name in candidates:
-                key = env_value(name)
-                if not key:
-                    continue
-                found = True
-                ident = f"{provider}:{name}:{name}"
-                if ident in seen:
-                    continue
-                seen.add(ident)
-                accounts.append({
-                    "id": ident, "provider": provider, "env": name, "key": key,
-                    "label": name, "monthly_limit": 0, "daily_limit": 0,
-                    "weight": 1.0, "disabled": False, "source": "env",
-                })
+            names.extend(env_index.get(base, ()))
+        for name in names:
+            key = (os.environ.get(name) or "").strip()
+            if not key:
+                continue
+            found = True
+            ident = f"{provider}:{name}:{name}"
+            if ident in seen:
+                continue
+            seen.add(ident)
+            accounts.append({
+                "id": ident, "provider": provider, "env": name, "key": key,
+                "label": name, "monthly_limit": 0, "daily_limit": 0,
+                "weight": 1.0, "disabled": False, "source": "env",
+            })
         if (not found and str(meta.get("auth") or "") in {"none", "optional"}
                 and provider in routable_providers):
             ident = f"{provider}:keyless:keyless"
@@ -5795,11 +5811,26 @@ def _assert_public_url(url: str) -> None:
             raise ValueError(f"refusing to fetch {host}: it resolves to the private address {ip}")
 
 
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any,
-                         newurl: str) -> Any:
-        _assert_public_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+_REDIRECT_HANDLER: Any = None
+
+
+def _redirect_handler_class() -> Any:
+    """Build the redirect guard on first use.
+
+    Subclassing `urllib.request.HTTPRedirectHandler` at module level would import
+    urllib.request (and ssl, http.client and the email parser with it) for every
+    command, so the class is created here instead.
+    """
+    global _REDIRECT_HANDLER
+    if _REDIRECT_HANDLER is None:
+        class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any,
+                                 newurl: str) -> Any:
+                _assert_public_url(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        _REDIRECT_HANDLER = _SafeRedirectHandler
+    return _REDIRECT_HANDLER
 
 
 def _web_get(url: str, timeout: float = 25.0, max_bytes: int = 3_000_000) -> tuple[str, str]:
@@ -5810,7 +5841,7 @@ def _web_get(url: str, timeout: float = 25.0, max_bytes: int = 3_000_000) -> tup
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.8",
     })
-    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    opener = urllib.request.build_opener(_redirect_handler_class()())
     with opener.open(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         body = response.read(max_bytes).decode(charset, errors="replace")
@@ -9474,15 +9505,40 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     return 2
 
 
+def in_git_checkout(path: Path) -> bool:
+    """True when `path` sits inside a git checkout (a dev tree, not an install)."""
+    return any((parent / ".git").exists() for parent in (path, *path.parents))
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
+    install_dir = script.parent
     targets = [script]
-    lib_dir = script.parent / "hyperrouter_lib"
+    # An installed copy is a `hyperrouter` launcher next to this file plus its
+    # bytecode cache; a git checkout has neither, so cleanup must not invent them.
+    launcher = install_dir / "hyperrouter"
+    if launcher.is_file() and not in_git_checkout(launcher):
+        targets.append(launcher)
+    lib_dir = install_dir / "hyperrouter_lib"
     if lib_dir.is_dir():
         targets.append(lib_dir)
+    cache_dir = install_dir / "__pycache__"
+    if cache_dir.is_dir() and not in_git_checkout(install_dir):
+        # A bin directory is shared: drop this program's bytecode, and the cache
+        # directory only when nothing else is left in it.
+        cached = sorted(cache_dir.glob(f"{PROG}*.pyc"))
+        targets.extend(cached)
+        if cached and not [entry for entry in cache_dir.iterdir() if entry not in set(cached)]:
+            targets.append(cache_dir)
     for name in ("hyperRouter", "agent-router"):
-        link = script.with_name(name)
-        if link.is_symlink() or (link.exists() and link.resolve() == script):
+        link = install_dir / name
+        if not (link.is_symlink() or link.exists()):
+            continue
+        try:
+            resolved = link.resolve()
+        except OSError:
+            continue
+        if resolved in targets or resolved == script:
             targets.append(link)
     config_dir = CONFIG_PATH.parent
     data_dir = DATA_HOME
@@ -10299,6 +10355,8 @@ def cmd_update(args: argparse.Namespace) -> int:
             die(f"git pull failed: {pull.stderr.strip()[:200]}")
         source = repo / "hyperrouter"
         target = Path(__file__).resolve()
+        if target.suffix == ".pyc":  # a stale cache file, not the script
+            target = target.with_suffix(".py")
         if source.is_file() and source.resolve() != target:
             backup(target)
             shutil.copy2(source, target)

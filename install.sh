@@ -74,14 +74,46 @@ run() {
 
 printf '%s\n' "hyperRouter installer"
 printf '%s\n' "  source: $src"
-printf '%s\n' "  target: $BIN/hyperrouter"
+printf '%s\n' "  target: $BIN/hyperrouter (launcher) + $BIN/hyperrouter.py"
 printf '%s\n' "  modules: $BIN/hyperrouter_lib"
 
 run mkdir -p "$BIN"
-run install -m 755 "$src" "$BIN/hyperrouter"
+run install -m 755 "$src" "$BIN/hyperrouter.py"
 run rm -rf "$BIN/hyperrouter_lib"
 run mkdir -p "$BIN/hyperrouter_lib"
 run install -m 644 "$lib_src"/*.py "$BIN/hyperrouter_lib/"
+
+# The router ships as hyperrouter.py, launched by a small `hyperrouter` shim, so
+# that Python can reuse its bytecode cache instead of recompiling 10k lines on
+# every run. Compiling here makes the first launch fast too.
+launcher() {
+  cat <<EOF
+#!/bin/sh
+# hyperRouter launcher, written by install.sh.
+#
+# The router itself lives in hyperrouter.py next to this file. Importing it as a
+# module lets Python keep the compiled bytecode in __pycache__, which is several
+# times faster than recompiling the whole script on every launch.
+PYTHON="\${HYPERROUTER_PYTHON:-python3}"
+here=\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)
+if [ ! -f "\$here/hyperrouter.py" ]; then
+  printf 'hyperrouter: %s/hyperrouter.py is missing; re-run install.sh\n' "\$here" >&2
+  exit 1
+fi
+exec "\$PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); import hyperrouter; raise SystemExit(hyperrouter.main(sys.argv[2:]))' "\$here" "\$@"
+EOF
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf 'would write: %s/hyperrouter (launcher for hyperrouter.py)\n' "$BIN"
+  printf 'would run: python3 -m compileall -q %s/hyperrouter.py %s/hyperrouter_lib\n' "$BIN" "$BIN"
+else
+  launcher > "$BIN/hyperrouter"
+  chmod 755 "$BIN/hyperrouter"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -m compileall -q "$BIN/hyperrouter.py" "$BIN/hyperrouter_lib" 2>/dev/null || :
+  fi
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'would link: %s -> hyperrouter\n' "$BIN/hyperRouter"

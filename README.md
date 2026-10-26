@@ -24,13 +24,16 @@ cd hyperRouter && ./install.sh        # ~/.local/bin, symlinks, then init
 ```
 
 `install.sh` is POSIX sh, never uses sudo, is safe to re-run, and supports
-`--dry-run`, `--no-init`, `HYPERROUTER_PREFIX` and `HYPERROUTER_SRC`. Manual install
-still works:
+`--dry-run`, `--no-init`, `HYPERROUTER_PREFIX`, `HYPERROUTER_SRC` and
+`HYPERROUTER_PYTHON`. It installs the router as `hyperrouter.py` and writes a
+small `hyperrouter` launcher beside it, so Python can reuse compiled bytecode
+instead of recompiling 10k lines on every run (about 1.2 s down to about 0.3 s
+per command). Manual install still works:
 
 ```bash
-install -m 755 hyperrouter ~/.local/bin/hyperrouter
+install -m 755 hyperrouter ~/.local/bin/hyperrouter.py
 cp -R hyperrouter_lib ~/.local/bin/hyperrouter_lib
-ln -sf hyperrouter ~/.local/bin/hyperRouter
+ln -sf hyperrouter.py ~/.local/bin/hyperrouter
 ```
 
 The script imports its helper package from a `hyperrouter_lib` directory next to
@@ -240,9 +243,12 @@ the bottom row fills the input; overlay rows are clickable too.
 `/find <text>` hides non-matching turns (`/find` clears), and `/keys` lists every
 shortcut.
 
-Network and email modules (`urllib`, `ssl`, `http.client`) are imported on first
-use, so `--help`, `settings`, catalog reads and the first TUI frame do not pay
-for the HTTP stack. The screen redraws at 25 fps only while a request is running;
+Network and email modules (`urllib`, `ssl`, `http.client`), `socket`, `tempfile`,
+`ipaddress`, `subprocess` and `shutil` are imported on first use, so `--help`,
+`settings`, catalog reads and the first TUI frame do not pay for the HTTP stack or
+the temporary-file helpers. A module-level *use* of one of them (a class base, a
+decorator, a constant) would load it eagerly and give the time back, so the
+redirect handler that guards `web_fetch` against SSRF is built on first use too. The screen redraws at 25 fps only while a request is running;
 when idle it blocks on the keyboard, so a parked TUI uses no CPU. Rendered turns and the streaming buffer
 are cached per width, and `@file` completion walks the tree once and reuses the index
 for 30 seconds instead of rescanning on every keystroke.
