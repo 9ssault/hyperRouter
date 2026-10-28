@@ -163,8 +163,10 @@ Free tiers are the bottleneck, so concurrency is capped deliberately.
 - `routing.max_concurrency` (default 3) gates concurrent upstream calls across the
   main loop and every worker, so a four-worker fan-out cannot stampede one key.
 - A provider that answers 402/429/5xx goes on a cooldown taken from its
-  `Retry after` header (or 90 s for quota, 45 s for upstream errors), and routing
-  skips it until the cooldown expires instead of retrying it blindly.
+  `Retry after` body hint or standard `Retry-After` header (delta seconds or HTTP
+  date; capped at one hour), with 90 s for quota or 45 s for upstream errors as a
+  fallback. Cooldowns are saved in the router SQLite settings and survive a service
+  restart; routing skips cooling providers instead of retrying them blindly.
 - Workers start staggered, retry once on a rate-limit/timeout, and each LLM call
   waits for a slot rather than failing immediately.
 
@@ -587,7 +589,7 @@ get http://127.0.0.1:8787/admin/stats    # requests, tokens, providers, MCP, coo
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t . -v   # 98 tests, offline, stdlib only
+python3 -m unittest discover -s tests -t . -v   # 106 tests, offline, stdlib only
 python3 -m compileall -q hyperrouter            # syntax gate
 ./install.sh --dry-run                          # what the installer would do
 bash -n contrib/hyperrouter.bash                # completion syntax
@@ -605,12 +607,14 @@ settings coercion/validation/docs, and harness availability checks. CI runs the 
 declares no console script because setuptools cannot ship the extension-less
 `hyperrouter` file as a module. `install.sh` is the supported install path.
 
-The first modules are extracted into `hyperrouter_lib/`: pure text/token/display
-helpers, the settings schema/defaults/validation, Anthropic Messages translation,
-and defensive guards (header stripping, refusal detection). The script
-adds its own directory to `sys.path`, so a checkout and an installed copy both
-work; a lone copied script reports exactly what is missing. `install.sh`,
-`hyperrouter update` and `hyperrouter uninstall` all handle the package.
+Reusable modules live in `hyperrouter_lib/`: pure text/token/display helpers,
+the settings schema/defaults/validation, Anthropic Messages translation,
+defensive guards (header stripping, refusal detection), the full-screen TUI, and
+project `@file` completion/indexing. The script adds its own directory to
+`sys.path`, so a checkout and an installed copy both work; a lone copied script
+reports exactly what is missing. `install.sh`, `hyperrouter update` and
+`hyperrouter uninstall` all handle the package. The staged terminal-first UI and
+optional shared-API web workspace direction is documented in [`ROADMAP.md`](ROADMAP.md).
 
 ## The proxy
 

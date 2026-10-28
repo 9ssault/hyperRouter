@@ -1,6 +1,7 @@
 """TUI responsiveness helpers, retry/filter, routing errors and harness checks."""
 
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -44,6 +45,8 @@ def fake_tui():
     app.ctx_tokens = 0
     app.ctx_cache = None
     app.busy = False
+    app.overlay = None
+    app.approval = None
     app.stream_buf = ""
     app.spinner = 0
     app.config = hr.load_config()
@@ -53,7 +56,51 @@ def fake_tui():
     app.click_targets = []
     app.model = "auto"
     app.notice = ""
+    app.buffer = ""
+    app.scroll = 0
+    app.pending_images = []
+    app.file_matches = []
+    app.file_index = []
+    app.file_index_at = 0.0
     return app
+
+
+class QuickOpenTest(unittest.TestCase):
+    def test_ctrl_k_starts_a_clean_conversation_and_persists(self):
+        app = fake_tui()
+        app.messages = [{"role": "user", "content": "old"}]
+        app.filter = "old"
+        app.scroll = 12
+        app.buffer = "draft"
+        app.pending_images = [{"name": "image.png", "url": "data:image/png;base64,AA=="}]
+        app.file_matches = ["old.py"]
+        persisted = []
+        warnings = []
+        app._persist = lambda: persisted.append(list(app.messages))
+        app._warn = warnings.append
+
+        self.assertTrue(app._key("\x0b"))
+        self.assertEqual(app.messages, [])
+        self.assertEqual(app.filter, "")
+        self.assertEqual(app.scroll, 0)
+        self.assertEqual(app.buffer, "")
+        self.assertEqual(app.pending_images, [])
+        self.assertEqual(app.file_matches, [])
+        self.assertEqual(persisted, [[]])
+        self.assertEqual(warnings, ["new conversation"])
+
+    def test_ctrl_k_does_not_discard_a_running_conversation(self):
+        app = fake_tui()
+        app.busy = True
+        app.messages = [{"role": "user", "content": "in flight"}]
+        warnings = []
+        app._warn = warnings.append
+        app._persist = lambda: self.fail("busy reset must not persist a changed session")
+
+        app._key("\x0b")
+
+        self.assertEqual(app.messages, [{"role": "user", "content": "in flight"}])
+        self.assertIn("cancel it with Ctrl+C", warnings[0])
 
 
 class TranscriptCacheTest(unittest.TestCase):
@@ -245,6 +292,208 @@ class SettingsBrowserTest(unittest.TestCase):
         self.assertGreater(len(items), 2)
         self.assertIn("no account added", next(item["label"] for item in items
                                                if item["value"] == "alpha/one"))
+
+
+class ProxyCooldownTest(unittest.TestCase):
+    def setUp(self):
+        conn = hr.connect()
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (hr.PROVIDER_COOLDOWN_SETTING,)).fetchone()
+        self.old_saved_cooldowns = row["value"] if row else None
+        conn.close()
+        self.old_cooldown_loaded = hr.PROVIDER_COOLDOWN_LOADED
+        self.old_cooldowns = hr.PROVIDER_COOLDOWN.copy()
+        conn = hr.connect()
+        conn.execute("DELETE FROM settings WHERE key=?", (hr.PROVIDER_COOLDOWN_SETTING,))
+        conn.commit()
+        conn.close()
+        hr.PROVIDER_COOLDOWN.clear()
+        hr.PROVIDER_COOLDOWN_LOADED = True
+
+    def tearDown(self):
+        conn = hr.connect()
+        if self.old_saved_cooldowns is None:
+            conn.execute("DELETE FROM settings WHERE key=?",
+                         (hr.PROVIDER_COOLDOWN_SETTING,))
+        else:
+            conn.execute("INSERT INTO settings(key,value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (hr.PROVIDER_COOLDOWN_SETTING, self.old_saved_cooldowns))
+        conn.commit()
+        conn.close()
+        hr.PROVIDER_COOLDOWN.clear()
+        hr.PROVIDER_COOLDOWN.update(self.old_cooldowns)
+        hr.PROVIDER_COOLDOWN_LOADED = self.old_cooldown_loaded
+
+    def test_retry_after_accepts_delta_date_and_provider_body_hints(self):
+        parse_retry_after = hr.retry_after_seconds
+        self.assertEqual(parse_retry_after("", {"Retry-After": "17"}), 17)
+        self.assertEqual(parse_retry_after("Retry after 23s", {"Retry-After": "17"}), 23)
+        future = datetime.now(timezone.utc) + timedelta(seconds=40)
+        date_header = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        wait = parse_retry_after("", {"Retry-After": date_header})
+        self.assertGreaterEqual(wait, 38)
+        self.assertLessEqual(wait, 40)
+        self.assertEqual(parse_retry_after("", {"Retry-After": "not a date"}), 0)
+        self.assertEqual(hr.cooldown_seconds(429, ""), 120)
+        self.assertEqual(hr.cooldown_seconds(503, ""), 60)
+        self.assertEqual(hr.model_cooldown_seconds(429, ""), 120)
+        self.assertEqual(hr.model_cooldown_seconds(404, "model unavailable"), 3600)
+        self.assertEqual(hr.cooldown_seconds(429, "Retry-After: 7200"), 3600)
+        self.assertEqual(hr.model_cooldown_seconds(503, "Retry-After: 0"), 1)
+
+    def test_retry_after_caps_and_persists_provider_cooldown_across_reload(self):
+        hr.note_provider_failure("cooldown-test", 429, "rate limited",
+                                 {"Retry-After": "7200"})
+        remaining = hr.provider_cooling("cooldown-test")
+        self.assertGreater(remaining, 3598)
+        self.assertLessEqual(remaining, 3600)
+
+        hr.PROVIDER_COOLDOWN.clear()
+        hr.PROVIDER_COOLDOWN_LOADED = False
+        reloaded = hr.provider_cooling("cooldown-test")
+        self.assertGreater(reloaded, 3590)
+        self.assertLessEqual(reloaded, 3600)
+
+    def test_non_streaming_route_uses_retry_after_header(self):
+        candidate = {"model": {"provider": "alpha", "model": "one"},
+                    "account": {"id": "alpha-account", "label": "test"}}
+        replacements = {
+            "prepare_route": lambda *args, **kwargs: ({"messages": []}, "auto", "chat",
+                                                        [candidate]),
+            "routing_timeout": lambda *_args, **_kwargs: 30.0,
+            "chat_url": lambda _provider: "https://provider.invalid",
+            "upstream_headers": lambda *_args, **_kwargs: {},
+            "provider_payload": lambda *_args, **_kwargs: {},
+            "http_json": lambda *_args, **_kwargs: (
+                429, {"retry-after": "23"}, {"error": "rate limited"}),
+            "record_attempt": lambda *_args, **_kwargs: None,
+        }
+        originals = {name: getattr(hr, name) for name in replacements}
+        try:
+            for name, function in replacements.items():
+                setattr(hr, name, function)
+            with self.assertRaises(RuntimeError):
+                hr.route_once([{"role": "user", "content": "quick test"}])
+            remaining = hr.provider_cooling("alpha")
+            self.assertGreater(remaining, 21)
+            self.assertLessEqual(remaining, 23)
+        finally:
+            for name, function in originals.items():
+                setattr(hr, name, function)
+
+    def test_transient_server_error_cools_provider_for_later_quick_prompts(self):
+        original_cooldown = hr.PROVIDER_COOLDOWN.copy()
+        hr.PROVIDER_COOLDOWN.clear()
+        try:
+            hr.note_provider_failure("alpha", 503, "upstream unavailable")
+            self.assertGreater(hr.provider_cooling("alpha"), 0)
+            self.assertEqual(hr.provider_cooling("beta"), 0)
+        finally:
+            hr.PROVIDER_COOLDOWN.clear()
+            hr.PROVIDER_COOLDOWN.update(original_cooldown)
+
+    def test_non_streaming_proxy_cools_down_failed_provider(self):
+        candidate = {"model": {"provider": "alpha", "model": "one"},
+                    "account": {"id": "alpha-account"}}
+        original = {name: getattr(hr, name) for name in
+                    ("load_config", "pick_models", "routing_timeout", "call_candidate")}
+        old_cooldowns = hr.PROVIDER_COOLDOWN.copy()
+        calls = []
+
+        class Handler:
+            def __init__(self):
+                self.responses = []
+
+            def send_json(self, status, payload):
+                self.responses.append((status, payload))
+
+        def fail_candidate(*_args, **_kwargs):
+            calls.append(True)
+            return False, {"status": 429, "error": "free limit reached",
+                           "provider": "alpha", "model": "one"}
+
+        hr.PROVIDER_COOLDOWN.clear()
+        hr.load_config = lambda: {"routing": {"max_fallbacks": 1}}
+        hr.pick_models = lambda *_args, **_kwargs: [candidate]
+        hr.routing_timeout = lambda *_args, **_kwargs: 30.0
+        hr.call_candidate = fail_candidate
+        try:
+            first = Handler()
+            hr.RouterHandler.handle_chat(first, {"messages": [
+                {"role": "user", "content": "hello"}]})
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first.responses[0][0], 502)
+            self.assertGreater(hr.provider_cooling("alpha"), 0)
+
+            second = Handler()
+            hr.RouterHandler.handle_chat(second, {"messages": [
+                {"role": "user", "content": "hello again"}]})
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(second.responses[0][0], 502)
+            self.assertIn("cooling down", second.responses[0][1]["error"]["details"][0]["error"])
+        finally:
+            for name, value in original.items():
+                setattr(hr, name, value)
+            hr.PROVIDER_COOLDOWN.clear()
+            hr.PROVIDER_COOLDOWN.update(old_cooldowns)
+
+    def test_streaming_proxy_cools_down_rate_limited_provider(self):
+        candidate = {"model": {"provider": "alpha", "model": "one"},
+                    "account": {"id": "alpha-account"}}
+        originals = {name: getattr(hr, name) for name in
+                     ("routing_timeout", "chat_url", "upstream_headers", "provider_payload",
+                      "record_attempt")}
+        original_urlopen = hr.urllib.request.urlopen
+        old_cooldowns = hr.PROVIDER_COOLDOWN.copy()
+        calls = []
+
+        class Handler:
+            def __init__(self):
+                self.responses = []
+
+            def send_json(self, status, payload):
+                self.responses.append((status, payload))
+
+        class RateLimitedError(urllib.error.HTTPError):
+            def read(self, *_args, **_kwargs):
+                return b"rate limit"
+
+        def rate_limited(*_args, **_kwargs):
+            calls.append(True)
+            error = RateLimitedError("https://provider.invalid", 429,
+                                     "rate limited", {"Retry-After": "23"}, None)
+            error.close = lambda: None
+            raise error
+
+        hr.PROVIDER_COOLDOWN.clear()
+        hr.routing_timeout = lambda *_args, **_kwargs: 30.0
+        hr.chat_url = lambda _provider: "https://provider.invalid"
+        hr.upstream_headers = lambda *_args, **_kwargs: {}
+        hr.provider_payload = lambda body, model: {"messages": body["messages"], "model": model}
+        hr.record_attempt = lambda *_args, **_kwargs: None
+        hr.urllib.request.urlopen = rate_limited
+        try:
+            first = Handler()
+            hr.RouterHandler.handle_stream(first, {"messages": [{"role": "user", "content": "hi"}]},
+                                           [candidate], "auto", "chat")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first.responses[0][0], 502)
+            self.assertGreater(hr.provider_cooling("alpha"), 21)
+            self.assertLessEqual(hr.provider_cooling("alpha"), 23)
+
+            second = Handler()
+            hr.RouterHandler.handle_stream(second, {"messages": [{"role": "user", "content": "again"}]},
+                                           [candidate], "auto", "chat")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(second.responses[0][0], 502)
+            self.assertIn("cooling down", second.responses[0][1]["error"]["details"][0]["error"])
+        finally:
+            for name, value in originals.items():
+                setattr(hr, name, value)
+            hr.urllib.request.urlopen = original_urlopen
+            hr.PROVIDER_COOLDOWN.clear()
+            hr.PROVIDER_COOLDOWN.update(old_cooldowns)
 
 
 class CoolingFallbackTest(unittest.TestCase):
